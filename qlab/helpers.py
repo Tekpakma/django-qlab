@@ -8,6 +8,7 @@ This module provides core functionality for:
 - Operation validation per field type
 """
 
+import json
 import re
 from copy import deepcopy
 from functools import lru_cache
@@ -15,7 +16,7 @@ from typing import List, Optional
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
-from django.db import models
+from django.db import DatabaseError, connections, models
 from django.db.models import ForeignKey, ManyToManyField, Q
 from django.db.models.fields.related import (
     ManyToManyRel,
@@ -26,6 +27,46 @@ from django.db.models.fields.related import (
 
 from qlab.model_validation import Condition, Filter
 from qlab.settings import qlab_settings
+
+_TEXT_OPS = ("is", "is_not", "icontains", "istartswith", "iendswith", "in", "not_in")
+_NUMBER_OPS = ("is", "is_not", "lt", "lte", "gt", "gte", "between", "in", "not_in")
+_DATE_OPS = ("is", "is_not", "lt", "lte", "gt", "gte", "between")
+
+# Ordered: the first matching entry wins, so subclasses must come before
+# their parents (e.g. DateTimeField before DateField).
+FIELD_OPS = (
+    # --- Text fields: equality, substring/prefix/suffix search, lists ---
+    (models.CharField, _TEXT_OPS),
+    (models.TextField, _TEXT_OPS),
+    (models.FilePathField, ("is", "is_not", "icontains")),
+    (models.GenericIPAddressField, ("is", "is_not", "icontains")),
+    # --- Numeric fields: equality, comparison, ranges, lists ---
+    (models.IntegerField, _NUMBER_OPS),
+    (models.FloatField, _NUMBER_OPS),
+    (models.DecimalField, _NUMBER_OPS),
+    # --- Boolean: only equality checks ---
+    (models.BooleanField, ("is", "is_not")),
+    # --- Date/time fields: equality, comparison, ranges ---
+    (models.DateTimeField, _DATE_OPS),
+    (models.DateField, _DATE_OPS),
+    (models.TimeField, _DATE_OPS),
+    # --- Relations: equality and lists of primary keys ---
+    (models.ForeignKey, ("is", "is_not", "in", "not_in")),
+    (models.OneToOneField, ("is", "is_not", "in", "not_in")),
+    (models.ManyToManyField, ("is", "is_not", "icontains")),
+    # --- Special types ---
+    (models.UUIDField, ("is", "is_not", "icontains", "istartswith", "in", "not_in")),
+    (models.JSONField, ("is", "is_not", "icontains")),
+    (models.FileField, ("is", "is_not")),
+)
+
+
+def _ops_for_field(field) -> tuple:
+    """Return the filter operations allowed for a Django field instance."""
+    for field_type, ops in FIELD_OPS:
+        if isinstance(field, field_type):
+            return ops
+    return ()
 
 
 def get_field_type_name(field) -> str:
@@ -96,44 +137,7 @@ def get_allowed_operations(field) -> List[str]:
         >>> get_allowed_operations(field)
         ['is', 'is_not', 'lt', 'lte', 'gt', 'gte']
     """
-    FIELD_OPS = {
-        # --- Text fields: support equality and substring search ---
-        models.CharField: ["is", "is_not", "icontains"],
-        models.TextField: ["is", "is_not", "icontains"],
-        models.EmailField: ["is", "is_not", "icontains"],
-        models.SlugField: ["is", "is_not", "icontains"],
-        models.URLField: ["is", "is_not", "icontains"],
-        models.FilePathField: ["is", "is_not", "icontains"],
-        models.GenericIPAddressField: ["is", "is_not", "icontains"],
-        # --- Numeric fields: support equality and comparison ---
-        models.IntegerField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.FloatField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.DecimalField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.PositiveIntegerField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.BigIntegerField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.SmallIntegerField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        # --- Boolean: only equality checks ---
-        models.BooleanField: ["is", "is_not"],
-        # --- Date/time fields: support equality and comparison ---
-        models.DateField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.DateTimeField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        models.TimeField: ["is", "is_not", "lt", "lte", "gt", "gte"],
-        # --- Relations: equality only (or contains for M2M) ---
-        models.ForeignKey: ["is", "is_not"],
-        models.OneToOneField: ["is", "is_not"],
-        models.ManyToManyField: ["is", "is_not", "icontains"],
-        # --- Special types ---
-        models.UUIDField: ["is", "is_not", "icontains"],
-        models.JSONField: ["is", "is_not", "icontains"],
-        models.FileField: ["is", "is_not"],
-        models.ImageField: ["is", "is_not"],
-    }
-
-    for field_type, allowed_ops in FIELD_OPS.items():
-        if isinstance(field, field_type):
-            return list(allowed_ops)
-
-    return []
+    return list(_ops_for_field(field))
 
 
 def extract_field_metadata(
@@ -413,7 +417,9 @@ def condition_to_q(cond: Condition) -> Q:
         - is -> exact match
         - is_not -> negated exact match
         - lt/lte/gt/gte -> comparison lookups
-        - icontains -> case-insensitive substring search
+        - icontains/istartswith/iendswith -> case-insensitive text search
+        - in/not_in -> membership in a list
+        - between -> inclusive range (value is [start, end])
 
     Args:
         cond: Condition with field, operation, and value
@@ -431,18 +437,62 @@ def condition_to_q(cond: Condition) -> Q:
 
     if cond.op == "is":
         return Q(**{lookup: value})
-    elif cond.op == "is_not":
+    if cond.op == "is_not":
         return ~Q(**{lookup: value})
-    elif cond.op == "lt":
-        return Q(**{f"{lookup}__lt": value})
-    elif cond.op == "lte":
-        return Q(**{f"{lookup}__lte": value})
-    elif cond.op == "gt":
-        return Q(**{f"{lookup}__gt": value})
-    elif cond.op == "gte":
-        return Q(**{f"{lookup}__gte": value})
-    elif cond.op == "icontains":
-        return Q(**{f"{lookup}__icontains": value})
+    if cond.op in ("lt", "lte", "gt", "gte"):
+        return Q(**{f"{lookup}__{cond.op}": value})
+    if cond.op in ("icontains", "istartswith", "iendswith"):
+        return Q(**{f"{lookup}__{cond.op}": value})
+    if cond.op == "in":
+        return Q(**{f"{lookup}__in": value})
+    if cond.op == "not_in":
+        return ~Q(**{f"{lookup}__in": value})
+    if cond.op == "between":
+        return Q(**{f"{lookup}__range": (value[0], value[1])})
+    raise ValueError(f"Unsupported operation: {cond.op}")
+
+
+def resolve_field(model, field_path: str):
+    """
+    Resolve a ``__`` field path to its final Django field instance.
+
+    Returns None if any part of the path does not exist.
+    """
+    current = model
+    field = None
+    parts = field_path.split("__")
+    for index, part in enumerate(parts):
+        try:
+            field = current._meta.get_field(part)
+        except FieldDoesNotExist:
+            return None
+        if index < len(parts) - 1:
+            current = getattr(field, "related_model", None)
+            if current is None:
+                return None
+    return field
+
+
+def estimate_count(queryset) -> tuple[Optional[int], bool]:
+    """
+    Cheaply estimate how many rows a queryset matches.
+
+    On PostgreSQL the planner's row estimate (``EXPLAIN``, without executing
+    the query) is used. Small results (below COUNT_ESTIMATE_THRESHOLD) and
+    other database backends fall back to an exact ``count()``.
+
+    Returns:
+        ``(count, is_exact)``
+    """
+    if queryset.db and connections[queryset.db].vendor == "postgresql":
+        try:
+            plan = json.loads(queryset.explain(format="json"))
+            estimate = int(plan[0]["Plan"]["Plan Rows"])
+        except (ValueError, KeyError, IndexError, TypeError, DatabaseError):
+            estimate = None
+        if estimate is not None and estimate > qlab_settings.COUNT_ESTIMATE_THRESHOLD:
+            return estimate, False
+    return queryset.count(), True
 
 
 def is_valid_lookup_syntax(lookup: str) -> bool:
@@ -816,55 +866,4 @@ def check_attribute_operation(model, field_name: str, op: str) -> bool:
     except FieldDoesNotExist:
         return False
 
-    FIELD_OPS = {
-        # --- Text fields: support equality and substring search ---
-        models.CharField: {
-            "is",
-            "is_not",
-            "icontains",
-            "iexact",
-            "startswith",
-            "endswith",
-        },
-        models.TextField: {
-            "is",
-            "is_not",
-            "icontains",
-            "iexact",
-            "startswith",
-            "endswith",
-        },
-        models.EmailField: {"is", "is_not", "icontains", "iexact"},
-        models.SlugField: {"is", "is_not", "icontains", "iexact"},
-        models.URLField: {"is", "is_not", "icontains", "iexact"},
-        models.FilePathField: {"is", "is_not", "icontains"},
-        models.GenericIPAddressField: {"is", "is_not", "icontains", "iexact"},
-        # --- Numeric fields: support equality and comparison ---
-        models.IntegerField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.FloatField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.DecimalField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.PositiveIntegerField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.BigIntegerField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.SmallIntegerField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        # --- Boolean: only equality checks ---
-        models.BooleanField: {"is", "is_not"},
-        # --- Date/time fields: support equality and comparison ---
-        models.DateField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.DateTimeField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        models.TimeField: {"is", "is_not", "lt", "lte", "gt", "gte"},
-        # --- Relations: equality only (or contains for M2M) ---
-        models.ForeignKey: {"is", "is_not"},
-        models.OneToOneField: {"is", "is_not"},
-        models.ManyToManyField: {"is", "is_not", "icontains"},
-        # --- Special types ---
-        models.UUIDField: {"is", "is_not", "icontains", "iexact"},
-        models.JSONField: {"is", "is_not", "icontains"},
-        models.FileField: {"is", "is_not"},
-        models.ImageField: {"is", "is_not"},
-    }
-
-    # Check if operation is allowed for this field type
-    for field_type, allowed_ops in FIELD_OPS.items():
-        if isinstance(field, field_type) and op in allowed_ops:
-            return True
-    return False
+    return op in _ops_for_field(field)

@@ -127,6 +127,34 @@ class MetaDataRequestSerializer(serializers.Serializer):
 
 
 # ---------------------------------------------------------------------------
+# Value Suggestions
+# ---------------------------------------------------------------------------
+
+
+class SuggestRequestSerializer(serializers.Serializer):
+    """Request for typeahead value suggestions of a single field."""
+
+    model = serializers.CharField(help_text="Model name (case-insensitive)")
+    app_label = serializers.CharField(required=False, allow_blank=True)
+    field = serializers.CharField(
+        help_text="Field path to suggest values for, e.g. 'status' or 'owner__name'"
+    )
+    q = serializers.CharField(
+        required=False, allow_blank=True, default="", help_text="Typed text to match"
+    )
+    match = serializers.ChoiceField(
+        choices=["prefix", "contains"], required=False, default="prefix"
+    )
+    limit = serializers.IntegerField(required=False, min_value=1)
+    cursor = serializers.CharField(
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text="next_cursor of the previous response",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Query Response
 # ---------------------------------------------------------------------------
 
@@ -135,11 +163,21 @@ class ResponseSerializer(serializers.Serializer):
     """Paginated query response with result list and pagination metadata."""
 
     count = serializers.IntegerField(
-        help_text="Total number of matching records across all pages"
+        allow_null=True,
+        help_text=(
+            "Total number of matching records across all pages. "
+            "Null when the request used count mode 'none'; an estimate "
+            "when count_exact is false."
+        ),
+    )
+    count_exact = serializers.BooleanField(
+        help_text="False if count is an estimate or was skipped"
     )
     page = serializers.IntegerField(help_text="Current page number (1-indexed)")
     page_size = serializers.IntegerField(help_text="Number of records per page")
-    total_pages = serializers.IntegerField(help_text="Total number of pages")
+    total_pages = serializers.IntegerField(
+        allow_null=True, help_text="Total number of pages, null if unknown"
+    )
     next = serializers.IntegerField(
         allow_null=True, help_text="Next page number, null if on last page"
     )

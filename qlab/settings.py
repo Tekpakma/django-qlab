@@ -16,6 +16,14 @@ QLAB_DEFAULTS = {
     "METADATA_INCLUDE_REVERSE_RELATIONS": False,
     "MAX_FILTER_CONDITIONS": 10,
     "MAX_AGGREGATIONS": 10,
+    "MAX_ORDER_FIELDS": 3,
+    "MAX_IN_VALUES": 200,
+    # "exact" | "estimate" | "none"; can be overridden per request via "count".
+    "DEFAULT_COUNT_MODE": "exact",
+    # In "estimate" mode, results below this planner estimate are counted exactly.
+    "COUNT_ESTIMATE_THRESHOLD": 10000,
+    "SUGGEST_LIMIT": 20,
+    "MAX_SUGGEST_LIMIT": 50,
     "MAX_NODES": 100,
     "MAX_HISTORY_ROWS": 100,
     "ALLOWED_APPS": [],

@@ -24,6 +24,11 @@ urlpatterns = [
         name="neighborhood",
     ),
     path(
+        "api/suggest/",
+        QLabFrontendApiViewSet.as_view({"post": "suggest"}),
+        name="suggest",
+    ),
+    path(
         "api/bootstrap/",
         QLabBootstrapViewSet.as_view({"get": "list"}),
         name="bootstrap",
