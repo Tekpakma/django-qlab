@@ -10,7 +10,7 @@ Defines serializers for:
 from rest_framework import serializers
 
 from qlab.helpers import model_exists
-from qlab.models import QLabUserSettings, QueryRunHistory, SavedQuery
+from qlab.models import QLabUserSettings, QueryRunHistory, SavedQuery, SharedQuery
 from qlab.settings import qlab_settings
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,10 @@ class FieldMetadataSerializer(serializers.Serializer):
     )
     primary_key = serializers.BooleanField(
         default=False, help_text="True if this field is the primary key"
+    )
+    unique = serializers.BooleanField(
+        default=False,
+        help_text="True if every row has a distinct value (primary key or unique=True)",
     )
     allowed_operations = serializers.ListField(
         child=serializers.CharField(),
@@ -276,7 +280,43 @@ class SavedQuerySerializer(serializers.ModelSerializer):
                 if self.instance and self.instance.app_label
                 else qlab_settings.DEFAULT_APP_LABEL
             )
+        if "query_payload" in attrs:
+            self._validate_runnable(attrs)
         return attrs
+
+    def _validate_runnable(self, attrs):
+        """
+        Reject payloads that could never run (unknown fields, wrongly typed
+        values such as id = "h"), so inline edits fail on save, not later.
+        """
+        from pydantic import ValidationError as PydanticValidationError
+
+        from qlab.model_validation import ValidationError as QLabValidationError
+        from qlab.pydantic_filters import QueryFilter
+
+        payload = attrs["query_payload"]
+        model_name = attrs.get("model_name") or (
+            self.instance.model_name if self.instance else None
+        )
+        try:
+            QueryFilter(
+                model=payload.get("model") or model_name,
+                select_fields=payload.get("select_fields") or [],
+                filter_fields=payload.get("filter_fields"),
+                aggregations=payload.get("aggregations") or [],
+                having=payload.get("having"),
+                order_by=payload.get("order_by") or [],
+                count=payload.get("count"),
+                page=1,
+                app_label=attrs.get("app_label"),
+            )
+        except QLabValidationError as exc:
+            messages = [error["msg"] for error in exc.errors()["errors"]]
+            raise serializers.ValidationError({"query_payload": messages})
+        except PydanticValidationError as exc:
+            raise serializers.ValidationError(
+                {"query_payload": [error["msg"] for error in exc.errors()]}
+            )
 
 
 class QueryRunHistorySerializer(serializers.ModelSerializer):
@@ -299,3 +339,30 @@ class QueryRunHistorySerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields
+
+
+class SharedQuerySerializer(serializers.ModelSerializer):
+    """A share link: the token plus the query payload it stands for."""
+
+    class Meta:
+        model = SharedQuery
+        fields = ["token", "app_label", "model_name", "query_payload", "created_at"]
+        read_only_fields = ["token", "created_at"]
+
+    def validate_model_name(self, value: str) -> str:
+        if not value:
+            raise serializers.ValidationError("model_name is required.")
+        return value
+
+    def validate_query_payload(self, value):
+        import json
+
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("query_payload must be an object.")
+        size = len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+        if size > qlab_settings.MAX_SHARE_PAYLOAD_BYTES:
+            raise serializers.ValidationError(
+                "This query is too large to share "
+                f"(maximum {qlab_settings.MAX_SHARE_PAYLOAD_BYTES} bytes)."
+            )
+        return value

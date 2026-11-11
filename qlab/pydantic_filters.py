@@ -12,22 +12,43 @@ QueryFilter performs comprehensive validation before query execution,
 ensuring type safety and preventing invalid database queries.
 """
 
-from typing import Literal, Optional
+import re
+from typing import Optional
 
 from django.apps import apps
 from pydantic import BaseModel, field_validator, model_validator
 
 from qlab.helpers import (
     check_attribute_operation,
+    check_value_type,
     find_to_many_relation_paths,
     flatten_filter_conditions,
     is_numeric_field_path,
     is_valid_lookup_syntax,
     model_exists,
+    resolve_value_field,
     validate_field_path,
 )
 from qlab.model_validation import Filter, ValidationError
 from qlab.settings import qlab_settings
+
+AGGREGATION_FUNCTIONS = ("count", "sum", "avg", "min", "max")
+
+# Operations allowed in ``having`` conditions. Aggregate values are numbers or
+# (for min/max) plain column values, so text search operators make no sense.
+HAVING_OPERATIONS = (
+    "is",
+    "is_not",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "between",
+    "in",
+    "not_in",
+)
+
+_ALIAS_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class AggregationSpec(BaseModel):
@@ -39,10 +60,11 @@ class AggregationSpec(BaseModel):
 
     Attributes:
         field: Field path to aggregate (e.g. "devices" for count, or
-            "devices__size" for sum/avg/min/max).
-        function: Aggregate function to apply.
+            "devices__size" for sum/avg/min/max). Optional for count: without
+            a field, the rows of each group are counted.
+        function: Aggregate function to apply (count, sum, avg, min, max).
         alias: Result key for the computed value. Defaults to
-            "{function}_{field}" if not given.
+            "{function}_{field}" (or "count" for a field-less count).
         distinct: Aggregate only distinct values of field (e.g. count of
             distinct regions rather than count of all matching rows).
 
@@ -51,15 +73,46 @@ class AggregationSpec(BaseModel):
         AggregationSpec(field='devices', function='count', alias='count_devices', distinct=False)
     """
 
-    field: str
-    function: Literal["count", "sum", "avg", "min", "max"]
+    field: Optional[str] = None
+    function: str
     alias: Optional[str] = None
     distinct: bool = False
 
+    @field_validator("function")
+    def validate_function(cls, function: str) -> str:
+        if function not in AGGREGATION_FUNCTIONS:
+            raise ValidationError(
+                [
+                    {
+                        "loc": ("aggregations", "function"),
+                        "msg": (
+                            f"Aggregation function '{function}' is not supported. "
+                            f"Valid functions are: {', '.join(AGGREGATION_FUNCTIONS)}."
+                        ),
+                        "type": "value_error.aggregation_function",
+                    }
+                ]
+            )
+        return function
+
     @model_validator(mode="after")
     def set_default_alias(self):
+        if self.field is not None and not self.field.strip():
+            self.field = None
+        if self.field is None and self.function != "count":
+            raise ValidationError(
+                [
+                    {
+                        "loc": ("aggregations", self.function),
+                        "msg": f"Aggregation '{self.function}' requires a field.",
+                        "type": "value_error.aggregation_field_missing",
+                    }
+                ]
+            )
         if not self.alias:
-            self.alias = f"{self.function}_{self.field}"
+            self.alias = (
+                f"{self.function}_{self.field}" if self.field else self.function
+            )
         return self
 
 
@@ -80,6 +133,8 @@ class QueryFilter(BaseModel):
         model: Name of the Django model to query
         select_fields: List of field paths to return in results
         filter_fields: Optional Filter object with query conditions
+        aggregations: Aggregations computed per group of select_fields
+        having: Optional Filter on aggregation aliases (SQL HAVING)
         page: Page number for pagination (1-indexed, default: 1)
 
     Raises:
@@ -121,6 +176,7 @@ class QueryFilter(BaseModel):
     select_fields: list[str]
     filter_fields: Optional[Filter] = None
     aggregations: list[AggregationSpec] = []
+    having: Optional[Filter] = None
     order_by: list[str] = []
     count: Optional[str] = None
     page: int = 1
@@ -309,39 +365,25 @@ class QueryFilter(BaseModel):
                                 "type": "operation_not_allowed",
                             }
                         )
+                        continue
+                    # And that the value fits the field type (id = "h" …)
+                    problem = check_value_type(
+                        resolve_value_field(model, cond.field), cond.op, cond.value
+                    )
+                    if problem:
+                        errors.append(
+                            {
+                                "loc": ("filter_fields", cond.field),
+                                "msg": f"Field '{cond.field}' {problem}.",
+                                "type": "value_error.value_type",
+                            }
+                        )
 
         # --- Validate Aggregations ---
-        max_aggregations = qlab_settings.MAX_AGGREGATIONS
-        if len(self.aggregations) > max_aggregations:
-            errors.append(
-                {
-                    "loc": ["aggregations"],
-                    "msg": f"Too many aggregations. Maximum allowed is {max_aggregations}.",
-                    "type": "value_error.max_aggregations",
-                }
-            )
-        else:
-            for agg in self.aggregations:
-                valid_field = self._validate_field(model, agg.field, errors)
+        self._validate_aggregations(model, errors)
 
-                # sum/avg on a non-numeric field silently returns 0 on some
-                # database backends (SQLite in particular) instead of
-                # raising — this can't be left to the database to catch.
-                if (
-                    valid_field
-                    and agg.function in ("sum", "avg")
-                    and not is_numeric_field_path(model, agg.field)
-                ):
-                    errors.append(
-                        {
-                            "loc": ("aggregations", agg.field),
-                            "msg": (
-                                f"Aggregation '{agg.function}' requires a numeric "
-                                f"field; '{agg.field}' is not numeric."
-                            ),
-                            "type": "value_error.aggregation_field_type",
-                        }
-                    )
+        # --- Validate Having (filters on aggregation aliases) ---
+        self._validate_having(model, errors)
 
         # --- Validate Order By ---
         self._validate_order_by(model, errors)
@@ -351,6 +393,175 @@ class QueryFilter(BaseModel):
             raise ValidationError(errors)
 
         return self
+
+    def _validate_aggregations(self, model, errors: list) -> None:
+        """Validate aggregation fields, function/field compatibility and aliases."""
+        max_aggregations = qlab_settings.MAX_AGGREGATIONS
+        if len(self.aggregations) > max_aggregations:
+            errors.append(
+                {
+                    "loc": ["aggregations"],
+                    "msg": f"Too many aggregations. Maximum allowed is {max_aggregations}.",
+                    "type": "value_error.max_aggregations",
+                }
+            )
+            return
+
+        model_field_names = {f.name for f in model._meta.get_fields()}
+        model_field_names.update(
+            getattr(f, "attname", f.name) for f in model._meta.get_fields()
+        )
+        seen_aliases: set[str] = set()
+        for agg in self.aggregations:
+            alias = agg.alias or ""
+            if not _ALIAS_PATTERN.match(alias) or "__" in alias:
+                errors.append(
+                    {
+                        "loc": ("aggregations", alias),
+                        "msg": (
+                            f"Alias '{alias}' is invalid. Use letters, digits and "
+                            "single underscores only."
+                        ),
+                        "type": "value_error.aggregation_alias",
+                    }
+                )
+            elif alias in seen_aliases:
+                errors.append(
+                    {
+                        "loc": ("aggregations", alias),
+                        "msg": f"Alias '{alias}' is used more than once.",
+                        "type": "value_error.aggregation_alias",
+                    }
+                )
+            elif alias in model_field_names or alias in self.select_fields:
+                # Django refuses annotations that shadow a model field, and a
+                # clash with a select field would silently overwrite a column.
+                errors.append(
+                    {
+                        "loc": ("aggregations", alias),
+                        "msg": (
+                            f"Alias '{alias}' conflicts with a field name; "
+                            "choose a different alias."
+                        ),
+                        "type": "value_error.aggregation_alias",
+                    }
+                )
+            seen_aliases.add(alias)
+
+            if agg.field is None:
+                continue
+            valid_field = self._validate_field(model, agg.field, errors)
+
+            # sum/avg on a non-numeric field silently returns 0 on some
+            # database backends (SQLite in particular) instead of
+            # raising — this can't be left to the database to catch.
+            if (
+                valid_field
+                and agg.function in ("sum", "avg")
+                and not is_numeric_field_path(model, agg.field)
+            ):
+                errors.append(
+                    {
+                        "loc": ("aggregations", agg.field),
+                        "msg": (
+                            f"Aggregation '{agg.function}' requires a numeric "
+                            f"field; '{agg.field}' is not numeric."
+                        ),
+                        "type": "value_error.aggregation_field_type",
+                    }
+                )
+
+    def _validate_having(self, model, errors: list) -> None:
+        """
+        Validate ``having`` conditions.
+
+        ``having`` filters the grouped rows by their aggregated values (SQL
+        HAVING), so every condition must reference an aggregation alias.
+        """
+        if not self.having:
+            return
+
+        if not self.aggregations:
+            errors.append(
+                {
+                    "loc": ("having",),
+                    "msg": "having can only be used together with aggregations.",
+                    "type": "value_error.having",
+                }
+            )
+            return
+
+        conditions = flatten_filter_conditions(self.having)
+        max_conditions = qlab_settings.MAX_FILTER_CONDITIONS
+        if len(conditions) > max_conditions:
+            errors.append(
+                {
+                    "loc": ("having",),
+                    "msg": f"Too many having conditions. Maximum allowed is {max_conditions}.",
+                    "type": "value_error.max_filter_conditions",
+                }
+            )
+            return
+
+        aliases = {agg.alias for agg in self.aggregations}
+        for cond in conditions:
+            if cond.field not in aliases:
+                errors.append(
+                    {
+                        "loc": ("having", cond.field),
+                        "msg": (
+                            f"'{cond.field}' is not an aggregation alias. "
+                            f"Available aliases: {', '.join(sorted(aliases))}."
+                        ),
+                        "type": "value_error.having",
+                    }
+                )
+                continue
+            agg = next(a for a in self.aggregations if a.alias == cond.field)
+            values = cond.value if isinstance(cond.value, list) else [cond.value]
+            if agg.function in ("count", "sum", "avg"):
+                for item in values:
+                    try:
+                        float(item)
+                    except (TypeError, ValueError):
+                        errors.append(
+                            {
+                                "loc": ("having", cond.field),
+                                "msg": f"'{cond.field}' is a number; '{item}' is not.",
+                                "type": "value_error.value_type",
+                            }
+                        )
+                        break
+            elif agg.field:
+                problem = check_value_type(
+                    resolve_value_field(model, agg.field), cond.op, cond.value
+                )
+                if problem:
+                    errors.append(
+                        {
+                            "loc": ("having", cond.field),
+                            "msg": f"'{cond.field}' {problem}.",
+                            "type": "value_error.value_type",
+                        }
+                    )
+            if cond.op not in HAVING_OPERATIONS:
+                errors.append(
+                    {
+                        "loc": ("having", cond.field),
+                        "msg": f"Operation '{cond.op}' is not allowed on aggregated values.",
+                        "type": "operation_not_allowed",
+                    }
+                )
+            if isinstance(cond.value, list) and (
+                len(cond.value) > qlab_settings.MAX_IN_VALUES
+            ):
+                errors.append(
+                    {
+                        "loc": ("having", cond.field),
+                        "msg": f"Too many values. Maximum allowed is {qlab_settings.MAX_IN_VALUES}.",
+                        "type": "value_error.max_in_values",
+                    }
+                )
 
     def _validate_order_by(self, model, errors: list) -> None:
         """
@@ -447,6 +658,20 @@ class QueryFilter(BaseModel):
                 }
             )
             return False
-        else:
-            # Syntax is valid, now check if the field actually exists
-            return validate_field_path(model, field, errors)
+        max_depth = qlab_settings.MAX_RELATION_DEPTH
+        if field.count("__") > max_depth:
+            # Every hop is a JOIN; unbounded paths are an easy way to put
+            # heavy load on the database.
+            errors.append(
+                {
+                    "loc": ("field",),
+                    "msg": (
+                        f"Field '{field}' follows too many relations. "
+                        f"Maximum allowed is {max_depth}."
+                    ),
+                    "type": "value_error.max_relation_depth",
+                }
+            )
+            return False
+        # Syntax is valid, now check if the field actually exists
+        return validate_field_path(model, field, errors)

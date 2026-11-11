@@ -1153,3 +1153,30 @@
     display: none;
   }
 }
+
+/* ── Saved query: inline filter parameter editing ──────────────────────── */
+.saved-query-params { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.saved-query-params-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.saved-query-params-head .docs-h2 { margin: 0; }
+.saved-query-param-list { display: flex; flex-direction: column; gap: 6px; }
+.saved-query-param-row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 90px minmax(0, 1.4fr);
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+}
+.saved-query-param-section { color: var(--accent); font-size: 0.62rem; letter-spacing: 0.06em; }
+.saved-query-param-field { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.saved-query-param-op { color: var(--muted); }
+.saved-query-param-value { color: var(--text); overflow-wrap: anywhere; }
+.saved-query-param-input { width: 100%; min-width: 0; }
+
+@media (max-width: 640px) {
+  .saved-query-param-row { grid-template-columns: 1fr 1fr; }
+}

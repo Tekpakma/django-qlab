@@ -4,24 +4,18 @@ import pytest
 from rest_framework.test import APIClient
 
 from qlab.models import ModelRegistry
-from tests.testapp.models import Device, Team
+from tests.testapp.models import Device, Member, Team
 
 
 @pytest.fixture
 def client(db):
     from django.contrib.auth import get_user_model
 
-    ModelRegistry.objects.bulk_create(
-        [
-            ModelRegistry(
-                model_label=f"testapp_{name}",
-                app_label="testapp",
-                model_name=name,
-                status="enabled",
-            )
-            for name in ("Device", "Team")
-        ]
-    )
+    for name in ("Device", "Team", "Member"):
+        ModelRegistry.objects.update_or_create(
+            model_label=f"testapp_{name}",
+            defaults={"app_label": "testapp", "model_name": name, "status": "enabled"},
+        )
     api = APIClient()
     api.force_authenticate(get_user_model().objects.create(username="tester"))
     return api
@@ -42,4 +36,16 @@ def devices(db):
             name=n, status=s, size=sz, team=t, created=c, meta={"k": n}
         )
         for n, s, sz, t, c in rows
+    ]
+
+
+@pytest.fixture
+def members(devices):
+    ops = Team.objects.get(name="Ops")
+    dev = Team.objects.get(name="Dev")
+    return [
+        Member.objects.create(name="ann", team=ops),
+        Member.objects.create(name="bob", team=ops),
+        Member.objects.create(name="cid", team=ops),
+        Member.objects.create(name="dan", team=dev),
     ]

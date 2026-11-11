@@ -16,6 +16,7 @@ from typing import List, Optional
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import ValidationError as DjangoCoreValidationError
 from django.db import DatabaseError, connections, models
 from django.db.models import ForeignKey, ManyToManyField, Q
 from django.db.models.fields.related import (
@@ -59,6 +60,136 @@ FIELD_OPS = (
     (models.JSONField, ("is", "is_not", "icontains")),
     (models.FileField, ("is", "is_not")),
 )
+
+
+def _excluded_field_keys() -> frozenset:
+    """
+    Lower-cased "app_label.Model.field" keys that QLab must never expose.
+
+    Defaults to the password hash of the user model, which is otherwise
+    reachable through any foreign key to the user (e.g. "owner__password").
+    """
+    from django.conf import settings as django_settings
+
+    configured = qlab_settings.get("EXCLUDED_FIELDS")
+    if configured is None:
+        configured = [f"{django_settings.AUTH_USER_MODEL}.password"]
+    return frozenset(entry.lower() for entry in configured)
+
+
+def is_excluded_field(model, field_name: str) -> bool:
+    """Return True if ``field_name`` of ``model`` is hidden via EXCLUDED_FIELDS."""
+    key = f"{model._meta.app_label}.{model.__name__}.{field_name}".lower()
+    return key in _excluded_field_keys()
+
+
+def _get_path_field(model, part: str):
+    """Resolve one path segment (forward field or reverse accessor) or None."""
+    try:
+        return model._meta.get_field(part)
+    except FieldDoesNotExist:
+        pass
+    for f in model._meta.get_fields():
+        if isinstance(f, (ManyToOneRel, ManyToManyRel, OneToOneRel)):
+            accessor = f.related_name or f.related_model._meta.model_name
+            if accessor == part:
+                return f
+    return None
+
+
+def related_models_on_path(model, field_path: str) -> list:
+    """
+    Return every related model a dunder path joins into (excluding ``model``).
+
+    Used to enforce the model registry (disabled / restricted models) on
+    relation traversal, not just on the model a query starts from.
+    """
+    reached = []
+    current = model
+    parts = field_path.split("__")
+    for index, part in enumerate(parts):
+        field = _get_path_field(current, part)
+        if field is None:
+            break
+        related = getattr(field, "related_model", None)
+        if related is None or not getattr(field, "is_relation", False):
+            break
+        reached.append(related)
+        current = related
+        if index == len(parts) - 1:
+            break
+    return reached
+
+
+def resolve_value_field(model, field_path: str):
+    """
+    Return the concrete field whose type a filter value on ``field_path``
+    must match. For relations (FK, O2O, M2M, reverse) that is the primary key
+    of the related model, since relation filters compare primary keys.
+    """
+    current = model
+    field = None
+    for part in field_path.split("__"):
+        field = _get_path_field(current, part)
+        if field is None:
+            return None
+        if getattr(field, "is_relation", False) and field.related_model is not None:
+            current = field.related_model
+    if field is not None and getattr(field, "is_relation", False):
+        related = getattr(field, "related_model", None)
+        return related._meta.pk if related is not None else None
+    return field
+
+
+_TEXT_SEARCH_OPS = ("icontains", "istartswith", "iendswith")
+
+
+def describe_expected_type(field) -> str:
+    if isinstance(field, models.BooleanField):
+        return "true or false"
+    if isinstance(field, (models.IntegerField, models.AutoField)):
+        return "a whole number"
+    if isinstance(field, (models.FloatField, models.DecimalField)):
+        return "a number"
+    if isinstance(field, models.DateTimeField):
+        return "a date/time like 2026-01-31 or 2026-01-31T12:00"
+    if isinstance(field, models.DateField):
+        return "a date like 2026-01-31"
+    if isinstance(field, models.TimeField):
+        return "a time like 13:45"
+    if isinstance(field, models.UUIDField):
+        return "a UUID"
+    return "a valid value"
+
+
+def check_value_type(field, op: str, value) -> Optional[str]:
+    """
+    Return an error message if ``value`` can't be used to filter ``field``
+    with ``op``, else None. Prevents database errors (and 500s) for input
+    like id = "h".
+    """
+    if field is None or op in _TEXT_SEARCH_OPS:
+        return None
+    if isinstance(field, (models.JSONField, models.FileField)):
+        return None
+    values = value if isinstance(value, list) else [value]
+    for item in values:
+        if isinstance(field, models.BooleanField):
+            # Accept whatever Django accepts ("true", "1", "t", ...), as before.
+            try:
+                field.to_python(item)
+            except (DjangoCoreValidationError, ValueError, TypeError):
+                return f"expects true or false, got '{item}'"
+            continue
+        if isinstance(item, bool):
+            return f"expects {describe_expected_type(field)}, got '{str(item).lower()}'"
+        try:
+            converted = field.to_python(item)
+        except (DjangoCoreValidationError, ValueError, TypeError):
+            return f"expects {describe_expected_type(field)}, got '{item}'"
+        if converted is None and item not in (None, ""):
+            return f"expects {describe_expected_type(field)}, got '{item}'"
+    return None
 
 
 def _ops_for_field(field) -> tuple:
@@ -204,6 +335,9 @@ def extract_field_metadata(
         else:
             field_name = field.name
 
+        if is_excluded_field(model, field_name):
+            continue
+
         full_field_path = f"{prefix}__{field_name}" if prefix else field_name
 
         if is_reverse:
@@ -251,6 +385,7 @@ def extract_field_metadata(
                 "required": not getattr(field, "null", True)
                 and not getattr(field, "blank", True),
                 "primary_key": getattr(field, "primary_key", False),
+                "unique": bool(getattr(field, "unique", False)),
                 "allowed_operations": get_allowed_operations(field),
             }
 
@@ -615,10 +750,28 @@ def validate_field_path(model, field_path: str, errors: list) -> bool:
                     }
                 )
             return False
+        if is_excluded_field(model, field_path):
+            errors.append(
+                {
+                    "loc": ("field",),
+                    "msg": f"Field '{field_path}' is not available in model {model.__name__}",
+                    "type": "value_error",
+                }
+            )
+            return False
         return True
     else:
         # Related field (has __ separator)
         related_name, remaining_path = field_path.split("__", 1)
+        if is_excluded_field(model, related_name):
+            errors.append(
+                {
+                    "loc": ("field",),
+                    "msg": f"Field '{related_name}' is not available in model {model.__name__}",
+                    "type": "value_error",
+                }
+            )
+            return False
 
         RELATION_TYPES = (
             ForeignKey,

@@ -66,8 +66,12 @@
   margin: 14px 0 6px;
 }
 
+/* Only the first heading of a card loses its top margin — the old
+   ".sidebar-card > div:first-child .sidebar-label" matched every heading in
+   the model panel, so "All Models" stuck to the list above it. */
 .sidebar-card > .sidebar-label:first-child,
-.sidebar-card > div:first-child .sidebar-label {
+.sidebar-card > div:first-child > .sidebar-label:first-child,
+.sidebar-search-wrap + .sidebar-label {
   margin-top: 0;
 }
 

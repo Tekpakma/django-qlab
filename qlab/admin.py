@@ -1,6 +1,12 @@
 from django.contrib import admin
 
-from qlab.models import ModelRegistry, QLabUserSettings, QueryRunHistory, SavedQuery
+from qlab.models import (
+    ModelRegistry,
+    QLabUserSettings,
+    QueryRunHistory,
+    SavedQuery,
+    SharedQuery,
+)
 
 
 @admin.register(QLabUserSettings)
@@ -53,6 +59,14 @@ class QueryRunHistoryAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "app_label", "model_name", "created_at")
     readonly_fields = ("created_at",)
+
+
+@admin.register(SharedQuery)
+class SharedQueryAdmin(admin.ModelAdmin):
+    list_display = ("token", "model_name", "app_label", "created_by", "created_at")
+    search_fields = ("token", "model_name", "app_label", "created_by__username")
+    list_filter = ("app_label", "model_name")
+    readonly_fields = ("created_at", "payload_hash")
 
 
 @admin.action(description="Enable selected models")

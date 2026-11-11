@@ -13,3 +13,9 @@ class Device(models.Model):
     created = models.DateTimeField(null=True)
     team = models.ForeignKey(Team, null=True, on_delete=models.CASCADE)
     meta = models.JSONField(default=dict)
+
+
+class Member(models.Model):
+    name = models.CharField(max_length=50)
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+    user = models.ForeignKey("auth.User", null=True, on_delete=models.SET_NULL)

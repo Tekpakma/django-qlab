@@ -11,12 +11,15 @@ QLAB_DEFAULTS = {
     "DEFAULT_APP_LABEL": "core",
     "PAGE_SIZE": 100,
     "MAX_PAGE_SIZE": 500,
+    # Max relation hops in a field path (e.g. 2 allows "team__owner__name").
     "MAX_RELATION_DEPTH": 2,
     "METADATA_MAX_RELATION_DEPTH": 1,
     "METADATA_INCLUDE_REVERSE_RELATIONS": False,
     "MAX_FILTER_CONDITIONS": 10,
     "MAX_AGGREGATIONS": 10,
     "MAX_ORDER_FIELDS": 3,
+    # Upper bound for rows written by the "export all" endpoint.
+    "MAX_EXPORT_ROWS": 100000,
     "MAX_IN_VALUES": 200,
     # "exact" | "estimate" | "none"; can be overridden per request via "count".
     "DEFAULT_COUNT_MODE": "exact",
@@ -26,7 +29,18 @@ QLAB_DEFAULTS = {
     "MAX_SUGGEST_LIMIT": 50,
     "MAX_NODES": 100,
     "MAX_HISTORY_ROWS": 100,
+    # Max size (in bytes of JSON) of a query payload stored for a share link.
+    "MAX_SHARE_PAYLOAD_BYTES": 65536,
+    # Dotted path to the ViewSet serving query/export/metadata/suggest/
+    # neighborhood. Point this at your scoped subclass so every endpoint —
+    # including saved-query runs and exports — uses the same get_queryset().
+    "QUERY_VIEWSET": "qlab.api_views.QLabFrontendApiViewSet",
     "ALLOWED_APPS": [],
+    # "app_label.Model.field" entries that are never exposed (metadata, query,
+    # suggest). None = default: the user model's password hash.
+    "EXCLUDED_FIELDS": None,
+    # Run history rows kept per user; older rows are pruned. 0 = keep all.
+    "HISTORY_RETENTION": 1000,
     "INCLUDE_MODEL_COUNTS": False,
     "ENVIRONMENT_LABEL": "Production",
 }

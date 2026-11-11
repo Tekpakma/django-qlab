@@ -11,7 +11,7 @@ These models ensure type safety and validate query structure before execution.
 
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 # Every filter operation the API accepts. Which of them a concrete field
 # supports is decided by qlab.helpers.FIELD_OPS.
@@ -315,6 +315,11 @@ class Filter(BaseModel):
         >>> #                  AND (size > 1000 OR priority = 'high')
         >>> #                  AND NOT archived = true
     """
+
+    # Unknown keys are rejected: otherwise a typo such as "and_operaton" (or a
+    # condition missing its "op") would parse as an empty filter and silently
+    # return every row.
+    model_config = ConfigDict(extra="forbid")
 
     and_operation: Optional[List[Union["Filter", Condition]]] = None
     or_operation: Optional[List[Union["Filter", Condition]]] = None

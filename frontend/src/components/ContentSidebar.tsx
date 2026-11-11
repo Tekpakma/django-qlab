@@ -17,6 +17,8 @@ export interface RecentQuery {
   title: string
   meta: string
   modelName: string
+  appLabel?: string
+  queryPayload?: Record<string, unknown>
 }
 
 export interface SavedQueryNavItem {

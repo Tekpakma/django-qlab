@@ -9,7 +9,7 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="{% static 'qlab/qlab.css' %}" />
+  <link rel="stylesheet" href="{% static 'qlab/qlab.css' %}?v={{ QLAB_ASSET_VERSION }}" />
 </head>
 <body>
   <div id="qlab-root"></div>
@@ -17,6 +17,6 @@
     window.__QLAB_API_BASE__ = "{{ QLAB_API_BASE|escapejs }}";
     window.__CSRF_TOKEN__ = "{{ csrf_token }}";
   </script>
-  <script type="module" src="{% static 'qlab/qlab.js' %}"></script>
+  <script type="module" src="{% static 'qlab/qlab.js' %}?v={{ QLAB_ASSET_VERSION }}"></script>
 </body>
 </html>

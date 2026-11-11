@@ -7,4 +7,5 @@ class QLabConfig(AppConfig):
     verbose_name = "QLab"
 
     def ready(self):
-        pass
+        # Connect the post_migrate handler that fills the ModelRegistry.
+        from qlab import signals  # noqa: F401

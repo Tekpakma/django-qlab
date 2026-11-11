@@ -12,16 +12,21 @@ Usage:
         permission_classes = [IsAuthenticated, MyCustomPermission]
 """
 
+import csv
+import json
 from time import monotonic
 from typing import Optional
 
 from django.apps import apps
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.db.models import Avg, Count, Max, Min, Q, Sum
+from django.http import StreamingHttpResponse
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, extend_schema, inline_serializer
+from pydantic import ValidationError as PydanticValidationError
 from rest_framework import serializers
 from rest_framework.response import Response
 
@@ -32,6 +37,7 @@ from qlab.helpers import (
     flatten_filter_conditions,
     get_model_metadata,
     is_valid_lookup_syntax,
+    related_models_on_path,
     resolve_field,
     validate_field_path,
 )
@@ -62,6 +68,73 @@ _ERROR_SCHEMA = inline_serializer(
         )
     },
 )
+
+
+AGGREGATE_FUNCTIONS = {
+    "count": Count,
+    "sum": Sum,
+    "avg": Avg,
+    "min": Min,
+    "max": Max,
+}
+
+
+def _parse_page_size(raw) -> tuple[int, Optional[str]]:
+    """Return ``(page_size, error)``; the size is capped at MAX_PAGE_SIZE."""
+    if raw is None or raw == "":
+        return min(qlab_settings.PAGE_SIZE, qlab_settings.MAX_PAGE_SIZE), None
+    if isinstance(raw, bool):
+        return 0, "page_size must be a positive integer."
+    try:
+        page_size = int(raw)
+    except (TypeError, ValueError):
+        return 0, "page_size must be a positive integer."
+    if page_size < 1:
+        return 0, "page_size must be a positive integer."
+    return min(page_size, qlab_settings.MAX_PAGE_SIZE), None
+
+
+class _Echo:
+    """File-like object whose write() just returns the value (for csv.writer)."""
+
+    def write(self, value):
+        return value
+
+
+# Cells starting with these characters are interpreted as formulas by Excel /
+# LibreOffice ("CSV injection"); text values get a leading apostrophe.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return "'" + value if value.startswith(_FORMULA_PREFIXES) else value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, cls=DjangoJSONEncoder, ensure_ascii=False)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _stream_csv(columns, rows):
+    writer = csv.writer(_Echo())
+    # UTF-8 BOM so spreadsheet apps detect the encoding of umlauts etc.
+    yield "\ufeff" + writer.writerow(columns)
+    for row in rows:
+        yield writer.writerow([_csv_cell(row.get(column)) for column in columns])
+
+
+def _stream_json(rows):
+    yield "["
+    first = True
+    for row in rows:
+        yield ("" if first else ",") + json.dumps(
+            row, cls=DjangoJSONEncoder, ensure_ascii=False
+        )
+        first = False
+    yield "]"
 
 
 def _field_error(loc: str, msg: str) -> Response:
@@ -124,6 +197,47 @@ def _check_restricted(
     return None
 
 
+def _blocked_related_model(model, field_paths, user) -> Optional[str]:
+    """
+    Return the name of a disabled/restricted model reached through any of the
+    field paths, or None if every traversed model may be read by ``user``.
+
+    Models that are not in the registry at all (e.g. auth.User behind an
+    "owner" foreign key) stay reachable; only explicitly disabled models and
+    restricted models the user has no group for are blocked.
+    """
+    from qlab.models import ModelRegistry
+
+    reached = {}
+    for path in field_paths:
+        for related in related_models_on_path(model, path):
+            reached[(related._meta.app_label, related.__name__)] = related
+    if not reached:
+        return None
+
+    entries = ModelRegistry.objects.filter(
+        app_label__in={app for app, _ in reached},
+        model_name__in={name for _, name in reached},
+    )
+    user_groups = None
+    for entry in entries:
+        if (entry.app_label, entry.model_name) not in reached:
+            continue
+        if entry.status == "disabled":
+            return entry.model_name
+        if entry.is_restricted:
+            if user_groups is None:
+                user_groups = (
+                    set(user.groups.values_list("pk", flat=True))
+                    if getattr(user, "is_authenticated", False)
+                    else set()
+                )
+            allowed = set(entry.allowed_groups.values_list("pk", flat=True))
+            if not (allowed & user_groups):
+                return entry.model_name
+    return None
+
+
 def _check_allowed_app(app_label: str) -> Optional[Response]:
     """Return a 403 Response if the app is not allowed, else None."""
     allowed_apps = qlab_settings.ALLOWED_APPS or []
@@ -142,6 +256,23 @@ def _check_allowed_app(app_label: str) -> Optional[Response]:
             status=403,
         )
     return None
+
+
+def _prune_query_history(user) -> None:
+    """Keep only the newest HISTORY_RETENTION runs per user."""
+    from qlab.models import QueryRunHistory
+
+    keep = int(qlab_settings.HISTORY_RETENTION or 0)
+    if keep <= 0:
+        return
+    # Cheap check first: only delete once the limit is exceeded, in batches.
+    stale_ids = list(
+        QueryRunHistory.objects.filter(user=user)
+        .order_by("-created_at", "-pk")
+        .values_list("pk", flat=True)[keep : keep + 500]
+    )
+    if stale_ids:
+        QueryRunHistory.objects.filter(pk__in=stale_ids).delete()
 
 
 def _record_query_history(
@@ -185,6 +316,7 @@ def _record_query_history(
             result_count=result_count,
             error_message=error_message,
         )
+        _prune_query_history(request.user)
     except Exception:
         # Query execution must not fail because optional history logging failed.
         pass
@@ -227,21 +359,89 @@ class QLabMixin:
         """
         return model.objects.all()
 
-    def execute_query(self, request, payload):
-        """Execute a QLab query payload and return a DRF Response."""
-        started_at = monotonic()
-        requested_model = payload.get("model", "")
-        app_label = payload.get("app_label", qlab_settings.DEFAULT_APP_LABEL)
+    def _error_response(
+        self,
+        request,
+        payload,
+        *,
+        app_label: str,
+        model_name: str,
+        started_at: float,
+        loc: str,
+        msg: str,
+        error_type: str = "value_error",
+        status: int = 400,
+    ) -> Response:
+        """Record a failed run in the history and build a QLab error response."""
+        _record_query_history(
+            request,
+            payload=payload,
+            app_label=app_label,
+            model_name=model_name or "unknown",
+            status="failed",
+            duration_ms=int((monotonic() - started_at) * 1000),
+            error_message=msg,
+        )
+        return Response(
+            ValidationError([{"loc": (loc,), "msg": msg, "type": error_type}]).errors(),
+            status=status,
+        )
+
+    def prepare_query(self, request, payload, started_at: float):
+        """
+        Validate a query payload and build the (unpaginated) queryset.
+
+        Shared by the paginated query endpoint and the export endpoint so both
+        apply exactly the same validation, access checks and ``get_queryset``
+        scoping.
+
+        Returns:
+            ``(prepared, None)`` on success, where ``prepared`` is a dict with
+            ``query``, ``model``, ``app_label``, ``queryset``, ``pk_field`` and
+            ``add_pk_column``; or ``(None, Response)`` on failure.
+        """
+        requested_model = payload.get("model", "") if hasattr(payload, "get") else ""
+        app_label = (
+            payload.get("app_label") if hasattr(payload, "get") else None
+        ) or qlab_settings.DEFAULT_APP_LABEL
+
+        if not isinstance(payload, dict) and not hasattr(payload, "get"):
+            return None, self._error_response(
+                request,
+                {},
+                app_label=app_label,
+                model_name="unknown",
+                started_at=started_at,
+                loc="body",
+                msg="The request body must be a JSON object.",
+            )
+
         try:
+            # "group_by" (issue #7) is an explicit alias for the select fields
+            # of an aggregation query: those are the GROUP BY columns.
+            group_by = payload.get("group_by")
+            if group_by is not None and not payload.get("aggregations"):
+                raise ValidationError(
+                    [
+                        {
+                            "loc": ("group_by",),
+                            "msg": "group_by requires at least one aggregation.",
+                            "type": "value_error.group_by",
+                        }
+                    ]
+                )
             query = QueryFilter(
                 model=payload["model"],
-                select_fields=payload["select_fields"],
+                select_fields=(
+                    group_by if group_by is not None else payload["select_fields"]
+                ),
                 filter_fields=payload.get("filter_fields", None),
-                aggregations=payload.get("aggregations", []),
-                order_by=payload.get("order_by", []),
+                aggregations=payload.get("aggregations", None) or [],
+                having=payload.get("having", None),
+                order_by=payload.get("order_by", None) or [],
                 count=payload.get("count", None),
                 page=payload.get("page", 1),
-                app_label=payload.get("app_label", qlab_settings.DEFAULT_APP_LABEL),
+                app_label=app_label,
             )
         except ValidationError as e:
             _record_query_history(
@@ -251,10 +451,21 @@ class QLabMixin:
                 model_name=requested_model or "unknown",
                 status="failed",
                 duration_ms=int((monotonic() - started_at) * 1000),
-                error_message=str(e),
+                error_message=str(e.errors()),
             )
-            return Response(e.errors(), status=400)
-        except KeyError as e:
+            return None, Response(e.errors(), status=400)
+        except PydanticValidationError as e:
+            # Structural problems (wrong types, malformed filter trees) are
+            # reported by pydantic itself; turn them into the QLab error shape
+            # instead of letting them bubble up as a 500.
+            errors = [
+                {
+                    "loc": tuple(str(part) for part in err.get("loc", ())),
+                    "msg": err.get("msg", "Invalid value."),
+                    "type": "value_error.invalid",
+                }
+                for err in e.errors()
+            ]
             _record_query_history(
                 request,
                 payload=payload,
@@ -262,14 +473,26 @@ class QLabMixin:
                 model_name=requested_model or "unknown",
                 status="failed",
                 duration_ms=int((monotonic() - started_at) * 1000),
-                error_message=f"{e.args[0]} is required.",
+                error_message="; ".join(err["msg"] for err in errors),
             )
-            return Response(
+            return None, Response(ValidationError(errors).errors(), status=400)
+        except KeyError as e:
+            msg = f"{e.args[0]} is required."
+            _record_query_history(
+                request,
+                payload=payload,
+                app_label=app_label,
+                model_name=requested_model or "unknown",
+                status="failed",
+                duration_ms=int((monotonic() - started_at) * 1000),
+                error_message=msg,
+            )
+            return None, Response(
                 {
                     "errors": [
                         {
                             "loc": [e.args[0]],
-                            "msg": f"{e.args[0]} is required.",
+                            "msg": msg,
                             "type": "value_error.missing",
                             "code": "VALUE_ERROR_MISSING",
                         }
@@ -290,7 +513,7 @@ class QLabMixin:
                 duration_ms=int((monotonic() - started_at) * 1000),
                 error_message=f"App '{app_label}' is not enabled for QLab.",
             )
-            return allowed_app
+            return None, allowed_app
         restricted = _check_restricted(query.model, app_label, request.user)
         if restricted:
             _record_query_history(
@@ -302,92 +525,141 @@ class QLabMixin:
                 duration_ms=int((monotonic() - started_at) * 1000),
                 error_message=f"Model '{query.model}' is restricted and cannot be queried.",
             )
-            return restricted
+            return None, restricted
         try:
             model = apps.get_model(app_label, query.model)
         except LookupError:
-            _record_query_history(
+            return None, self._error_response(
                 request,
-                payload=payload,
+                payload,
                 app_label=app_label,
                 model_name=query.model,
-                status="failed",
-                duration_ms=int((monotonic() - started_at) * 1000),
-                error_message=f"Model '{query.model}' does not exist in app '{app_label}'.",
-            )
-            return Response(
-                {
-                    "errors": [
-                        {
-                            "loc": ["model"],
-                            "msg": f"Model '{query.model}' does not exist in app '{app_label}'.",
-                            "type": "value_error",
-                            "code": "VALUE_ERROR",
-                        }
-                    ]
-                },
-                status=400,
+                started_at=started_at,
+                loc="model",
+                msg=f"Model '{query.model}' does not exist in app '{app_label}'.",
             )
 
-        filter_fields = getattr(query, "filter_fields", None)
-        q_obj = build_q(query.filter_fields) if filter_fields else Q()
+        # --- Access control on relation traversal ---
+        # The model a query starts from is checked above; paths like
+        # "owner__group__name" must not reach into disabled or restricted
+        # models either.
+        filter_conditions = (
+            flatten_filter_conditions(query.filter_fields)
+            if query.filter_fields
+            else []
+        )
+        all_paths = (
+            list(query.select_fields)
+            + [condition.field for condition in filter_conditions]
+            + [agg.field for agg in query.aggregations if agg.field]
+            + [
+                entry.lstrip("-")
+                for entry in query.order_by
+                if entry.lstrip("-") not in {agg.alias for agg in query.aggregations}
+            ]
+        )
+        blocked = _blocked_related_model(model, all_paths, request.user)
+        if blocked:
+            return None, self._error_response(
+                request,
+                payload,
+                app_label=app_label,
+                model_name=query.model,
+                started_at=started_at,
+                loc="field",
+                msg=f"Model '{blocked}' is restricted and cannot be queried through a relation.",
+                error_type="value_error.restricted",
+                status=403,
+            )
 
-        # Always include PK in results even if not in select_fields
+        q_obj = build_q(query.filter_fields) if query.filter_fields else Q()
+
         pk_field = model._meta.pk.name
         select_fields = list(query.select_fields)
-        pk_included = pk_field in select_fields
-        if not pk_included:
-            select_fields = [pk_field] + select_fields
 
-        AGGREGATE_FUNCTIONS = {
-            "count": Count,
-            "sum": Sum,
-            "avg": Avg,
-            "min": Min,
-            "max": Max,
-        }
-        aggregate_kwargs = {
-            agg.alias: AGGREGATE_FUNCTIONS[agg.function](
-                agg.field, distinct=agg.distinct
-            )
-            for agg in query.aggregations
-        }
+        def to_many_paths(paths) -> list[str]:
+            found: list[str] = []
+            for path in paths:
+                for relation_path in find_to_many_relation_paths(model, path):
+                    if relation_path not in found:
+                        found.append(relation_path)
+            return found
 
-        if aggregate_kwargs:
-            # select_fields are the GROUP BY columns here — annotate() folds
-            # every matching related row into one aggregate value per group,
-            # so there's no row-level duplication to guard against. Ordering
-            # by the group-by columns themselves is already fully
-            # deterministic: their combination is unique per output row by
-            # construction of GROUP BY. (Using pk_field here instead would
-            # pull it into the GROUP BY and silently break the aggregation,
-            # since every row already has a distinct id.)
+        select_joins = to_many_paths(select_fields)
+        filter_joins = to_many_paths(c.field for c in filter_conditions)
+
+        if query.aggregations:
+            agg_chains = {
+                agg.alias: to_many_paths([agg.field]) if agg.field else []
+                for agg in query.aggregations
+            }
+            aggregated_joins = {path for chain in agg_chains.values() for path in chain}
+            # A filter on the relation that is being aggregated restricts the
+            # aggregated rows ("sum of sizes of devices > 5"), like SQL WHERE.
+            # A filter on any other to-many relation only selects base
+            # objects; applying it as a JOIN would multiply the aggregated
+            # rows, so it goes through a pk subquery instead.
+            filter_as_join = set(filter_joins) <= aggregated_joins
+            joins = set(select_joins) | aggregated_joins
+            if filter_as_join:
+                joins |= set(filter_joins)
+
+            for agg in query.aggregations:
+                inflating = agg.function in ("sum", "avg") or (
+                    agg.function == "count" and agg.field and not agg.distinct
+                )
+                extra = joins - set(agg_chains[agg.alias])
+                if inflating and extra:
+                    return None, self._error_response(
+                        request,
+                        payload,
+                        app_label=app_label,
+                        model_name=query.model,
+                        started_at=started_at,
+                        loc="aggregations",
+                        msg=(
+                            f"Aggregation '{agg.alias}' would be multiplied by the "
+                            f"join over {', '.join(sorted(extra))}. Use count with "
+                            "distinct, min/max, or split this into separate queries."
+                        ),
+                        error_type="value_error.aggregation_join",
+                    )
+
+            aggregate_kwargs = {
+                agg.alias: (
+                    AGGREGATE_FUNCTIONS[agg.function](agg.field, distinct=agg.distinct)
+                    if agg.field
+                    # Field-less count counts the base objects of each group;
+                    # distinct keeps joins from inflating it.
+                    else Count("pk", distinct=True)
+                )
+                for agg in query.aggregations
+            }
+            # select_fields are the GROUP BY columns here. The primary key
+            # must NOT be added: values(pk, ...) would put it into the
+            # GROUP BY and collapse every group to a single row. Ordering by
+            # the group-by columns is fully deterministic, since their
+            # combination is unique per output row by construction.
+            add_pk_column = False
             order_fields = list(select_fields)
         else:
-            # Collect every to-many relation (reverse FK / M2M) crossed by
-            # select_fields or filter_fields. Such a relation makes Django
-            # JOIN and duplicate the base row once per related record;
-            # ordering by the base pk alone leaves those duplicate rows in
-            # an arbitrary relative order, which can make LIMIT/OFFSET
-            # pagination split or duplicate rows across page boundaries.
-            # Adding each relation's own pk as a secondary sort key makes
-            # the row order fully deterministic.
-            to_many_relations: list[str] = []
-            for field_name in select_fields:
-                for relation_path in find_to_many_relation_paths(model, field_name):
-                    if relation_path not in to_many_relations:
-                        to_many_relations.append(relation_path)
-            if filter_fields:
-                for condition in flatten_filter_conditions(query.filter_fields):
-                    for relation_path in find_to_many_relation_paths(
-                        model, condition.field
-                    ):
-                        if relation_path not in to_many_relations:
-                            to_many_relations.append(relation_path)
+            aggregate_kwargs = {}
+            # A filter across a to-many relation only decides WHICH objects
+            # match; it goes through a pk subquery so a Team with three
+            # matching devices is still returned once.
+            filter_as_join = False
+            # Always include the PK in plain row queries, even when it is not
+            # selected, so the UI can identify rows.
+            add_pk_column = pk_field not in select_fields
+            if add_pk_column:
+                select_fields = [pk_field] + select_fields
 
-            order_fields = [pk_field] + [
-                f"{relation}__pk" for relation in to_many_relations
-            ]
+            # Selecting a to-many field (e.g. "device__name") intentionally
+            # yields one row per related record. Ordering by the base pk
+            # alone would leave those rows in arbitrary relative order and
+            # LIMIT/OFFSET pagination could split or repeat them, so each
+            # relation's pk is added as a tiebreaker.
+            order_fields = [pk_field] + [f"{relation}__pk" for relation in select_joins]
 
         # User ordering comes first; the deterministic keys above stay as
         # tiebreakers so LIMIT/OFFSET pagination remains stable.
@@ -397,43 +669,113 @@ class QLabMixin:
             f for f in order_fields if f not in requested_names
         ]
 
-        def page_out_of_range():
-            _record_query_history(
+        # Apply custom scoping via get_queryset(), then apply QLab filters on top.
+        # Value conversion happens here (Django prepares lookup values while
+        # building the query), so anything validation missed becomes a 400.
+        try:
+            base = self.get_queryset(model)
+            if filter_joins and not filter_as_join:
+                base = base.filter(pk__in=base.filter(q_obj).values("pk"))
+            else:
+                base = base.filter(q_obj)
+            queryset = base.values(*select_fields)
+            if aggregate_kwargs:
+                queryset = queryset.annotate(**aggregate_kwargs)
+                if query.having:
+                    # Filtering on an aggregate annotation becomes SQL HAVING.
+                    queryset = queryset.filter(build_q(query.having))
+        except (ValueError, TypeError, DjangoValidationError) as e:
+            return None, self._invalid_values_response(
                 request,
-                payload=payload,
+                payload,
+                {"app_label": app_label, "query": query},
+                started_at,
+                e,
+            )
+        queryset = queryset.order_by(*order_fields)
+
+        return (
+            {
+                "query": query,
+                "model": model,
+                "app_label": app_label,
+                "queryset": queryset,
+                "pk_field": pk_field,
+                "add_pk_column": add_pk_column,
+            },
+            None,
+        )
+
+    @staticmethod
+    def _with_id_column(rows, prepared):
+        """Expose the pk as "id" when it was added only for row identification."""
+        if not prepared["add_pk_column"]:
+            return rows
+        pk_field = prepared["pk_field"]
+        return [{"id": row[pk_field], **row} for row in rows]
+
+    def _invalid_values_response(self, request, payload, prepared, started_at, exc):
+        _record_query_history(
+            request,
+            payload=payload,
+            app_label=prepared["app_label"],
+            model_name=prepared["query"].model,
+            status="failed",
+            duration_ms=int((monotonic() - started_at) * 1000),
+            error_message=str(exc),
+        )
+        return Response(
+            {
+                "errors": [
+                    {
+                        "loc": ["filter_fields"],
+                        "msg": "One or more filter values are invalid for the selected field.",
+                        "type": "value_error.filter",
+                        "code": "VALUE_ERROR_FILTER",
+                    }
+                ]
+            },
+            status=400,
+        )
+
+    def execute_query(self, request, payload):
+        """Execute a QLab query payload and return a DRF Response."""
+        started_at = monotonic()
+        prepared, error_response = self.prepare_query(request, payload, started_at)
+        if error_response is not None:
+            return error_response
+
+        query = prepared["query"]
+        app_label = prepared["app_label"]
+        raw_results = prepared["queryset"]
+
+        page_size, page_size_error = _parse_page_size(payload.get("page_size"))
+        if page_size_error:
+            return self._error_response(
+                request,
+                payload,
                 app_label=app_label,
                 model_name=query.model,
-                status="failed",
-                duration_ms=int((monotonic() - started_at) * 1000),
-                error_message=f"Page '{query.page}' is out of range.",
+                started_at=started_at,
+                loc="page_size",
+                msg=page_size_error,
             )
-            return Response(
-                {
-                    "errors": [
-                        {
-                            "loc": ["page"],
-                            "msg": f"Page '{query.page}' is out of range.",
-                            "type": "value_error.page",
-                            "code": "VALUE_ERROR_PAGE",
-                        }
-                    ]
-                },
-                status=400,
+
+        def page_out_of_range():
+            return self._error_response(
+                request,
+                payload,
+                app_label=app_label,
+                model_name=query.model,
+                started_at=started_at,
+                loc="page",
+                msg=f"Page '{query.page}' is out of range.",
+                error_type="value_error.page",
             )
 
         count_mode = query.count or qlab_settings.DEFAULT_COUNT_MODE
-        page_size = min(
-            payload.get("page_size", qlab_settings.PAGE_SIZE),
-            qlab_settings.MAX_PAGE_SIZE,
-        )
 
-        # Apply custom scoping via get_queryset(), then apply QLab filters on top
         try:
-            raw_results = self.get_queryset(model).filter(q_obj).values(*select_fields)
-            if aggregate_kwargs:
-                raw_results = raw_results.annotate(**aggregate_kwargs)
-            raw_results = raw_results.order_by(*order_fields)
-
             if count_mode == "exact":
                 paginator = Paginator(raw_results, page_size)
                 try:
@@ -463,33 +805,9 @@ class QLabMixin:
                     if total_count is not None:
                         total_pages = max(1, -(-total_count // page_size))
         except (ValueError, TypeError, DjangoValidationError) as e:
-            _record_query_history(
-                request,
-                payload=payload,
-                app_label=app_label,
-                model_name=query.model,
-                status="failed",
-                duration_ms=int((monotonic() - started_at) * 1000),
-                error_message=str(e),
+            return self._invalid_values_response(
+                request, payload, prepared, started_at, e
             )
-            return Response(
-                {
-                    "errors": [
-                        {
-                            "loc": ["filter_fields"],
-                            "msg": "One or more filter values are invalid for the selected field.",
-                            "type": "value_error.filter",
-                            "code": "VALUE_ERROR_FILTER",
-                        }
-                    ]
-                },
-                status=400,
-            )
-
-        if not pk_included:
-            results = [{"id": row[pk_field], **row} for row in rows]
-        else:
-            results = rows
 
         data = {
             "count": total_count,
@@ -499,7 +817,7 @@ class QLabMixin:
             "total_pages": total_pages,
             "next": query.page + 1 if has_next else None,
             "previous": query.page - 1 if has_previous else None,
-            "results": results,
+            "results": self._with_id_column(rows, prepared),
         }
 
         _record_query_history(
@@ -514,6 +832,84 @@ class QLabMixin:
 
         return Response(ResponseSerializer(data).data)
 
+    def export_query(self, request, payload):
+        """
+        Export every row of a query (not just one page) as CSV or JSON.
+
+        The rows are streamed in chunks, so large exports don't have to be
+        held in memory. At most ``MAX_EXPORT_ROWS`` rows are written; the
+        ``X-QLab-Total-Count`` and ``X-QLab-Truncated`` headers tell the
+        client whether the export was cut off.
+        """
+        started_at = monotonic()
+        export_format = (
+            payload.get("format", "csv") if hasattr(payload, "get") else "csv"
+        )
+        if export_format not in ("csv", "json"):
+            return _field_error("format", "format must be 'csv' or 'json'.")
+
+        prepared, error_response = self.prepare_query(request, payload, started_at)
+        if error_response is not None:
+            return error_response
+
+        query = prepared["query"]
+        queryset = prepared["queryset"]
+        max_rows = int(qlab_settings.MAX_EXPORT_ROWS)
+
+        try:
+            total_count = queryset.count()
+        except (ValueError, TypeError, DjangoValidationError) as e:
+            return self._invalid_values_response(
+                request, payload, prepared, started_at, e
+            )
+
+        truncated = total_count > max_rows
+        exported = min(total_count, max_rows)
+        _record_query_history(
+            request,
+            payload={**payload, "export_format": export_format},
+            app_label=prepared["app_label"],
+            model_name=query.model,
+            status="success",
+            duration_ms=int((monotonic() - started_at) * 1000),
+            result_count=exported,
+        )
+
+        columns = list(query.select_fields)
+        if prepared["add_pk_column"]:
+            columns = ["id"] + columns
+        columns += [agg.alias for agg in query.aggregations]
+
+        def iter_rows():
+            chunk = []
+            for row in queryset[:max_rows].iterator(chunk_size=2000):
+                chunk.append(row)
+                if len(chunk) >= 2000:
+                    yield from self._with_id_column(chunk, prepared)
+                    chunk = []
+            if chunk:
+                yield from self._with_id_column(chunk, prepared)
+
+        timestamp = timezone.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{query.model.lower()}-{timestamp}.{export_format}"
+        if export_format == "csv":
+            content_type = "text/csv; charset=utf-8"
+            stream = _stream_csv(columns, iter_rows())
+        else:
+            content_type = "application/json"
+            stream = _stream_json(iter_rows())
+
+        response = StreamingHttpResponse(stream, content_type=content_type)
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["X-QLab-Total-Count"] = str(total_count)
+        response["X-QLab-Exported-Count"] = str(exported)
+        response["X-QLab-Truncated"] = "true" if truncated else "false"
+        response["Access-Control-Expose-Headers"] = (
+            "Content-Disposition, X-QLab-Total-Count, X-QLab-Exported-Count, "
+            "X-QLab-Truncated"
+        )
+        return response
+
     @extend_schema(
         summary="Execute Dynamic Query",
         description=(
@@ -527,6 +923,18 @@ class QLabMixin:
                 "model": serializers.CharField(),
                 "select_fields": serializers.ListField(child=serializers.CharField()),
                 "filter_fields": serializers.DictField(required=False),
+                "aggregations": serializers.ListField(
+                    child=serializers.DictField(),
+                    required=False,
+                    help_text=(
+                        "Aggregations computed per group of select_fields: "
+                        "{field?, function, alias?, distinct?}."
+                    ),
+                ),
+                "having": serializers.DictField(
+                    required=False,
+                    help_text="Filter tree on aggregation aliases (SQL HAVING).",
+                ),
                 "order_by": serializers.ListField(
                     child=serializers.CharField(),
                     required=False,
@@ -570,6 +978,44 @@ class QLabMixin:
     def post(self, request):
         """Execute a dynamic QLab query."""
         return self.execute_query(request, request.data)
+
+    @extend_schema(
+        summary="Export Dynamic Query",
+        description=(
+            "Export all rows of a query (every page) as CSV or JSON.\n\n"
+            "Takes the same payload as the query endpoint plus an optional "
+            "format ('csv' or 'json'). page and page_size are ignored. At most "
+            "MAX_EXPORT_ROWS rows are exported; the X-QLab-Truncated response "
+            "header is 'true' when the result was cut off."
+        ),
+        request=inline_serializer(
+            name="QLabExportRequest",
+            fields={
+                "model": serializers.CharField(),
+                "select_fields": serializers.ListField(child=serializers.CharField()),
+                "filter_fields": serializers.DictField(required=False),
+                "aggregations": serializers.ListField(
+                    child=serializers.DictField(), required=False
+                ),
+                "having": serializers.DictField(required=False),
+                "order_by": serializers.ListField(
+                    child=serializers.CharField(), required=False
+                ),
+                "format": serializers.ChoiceField(
+                    choices=["csv", "json"], required=False, default="csv"
+                ),
+                "app_label": serializers.CharField(required=False),
+            },
+        ),
+        responses={
+            (200, "text/csv"): str,
+            (200, "application/json"): str,
+            400: _ERROR_SCHEMA,
+        },
+    )
+    def export(self, request):
+        """Export every row of a dynamic QLab query."""
+        return self.export_query(request, request.data)
 
 
 class QLabSuggestMixin:
@@ -639,6 +1085,20 @@ class QLabSuggestMixin:
             return Response(
                 ValidationError(errors or [_syntax_error(field_path)]).errors(),
                 status=400,
+            )
+        blocked = _blocked_related_model(model, [field_path], request.user)
+        if blocked:
+            return Response(
+                ValidationError(
+                    [
+                        {
+                            "loc": ("field",),
+                            "msg": f"Model '{blocked}' is restricted and cannot be queried through a relation.",
+                            "type": "value_error.restricted",
+                        }
+                    ]
+                ).errors(),
+                status=403,
             )
         field = resolve_field(model, field_path)
         if (

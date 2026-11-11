@@ -1,8 +1,30 @@
+import hashlib
+from functools import lru_cache
+
+from django.contrib.staticfiles import finders
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import ensure_csrf_cookie
+
+
+@lru_cache(maxsize=1)
+def _asset_version() -> str:
+    """
+    Short content hash of the bundled UI assets.
+
+    The bundle has fixed file names (qlab.js / qlab.css), so without a
+    version in the URL browsers keep serving the old UI after an upgrade.
+    Computed once per process.
+    """
+    digest = hashlib.sha256()
+    for name in ("qlab/qlab.js", "qlab/qlab.css"):
+        path = finders.find(name)
+        if path:
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+    return digest.hexdigest()[:12]
 
 
 @method_decorator(ensure_csrf_cookie, name="dispatch")
@@ -33,5 +55,6 @@ class QLabView(View):
             context={
                 "QLAB_VERSION": self.graphiql_version,
                 "QLAB_API_BASE": api_base,
+                "QLAB_ASSET_VERSION": _asset_version(),
             },
         )

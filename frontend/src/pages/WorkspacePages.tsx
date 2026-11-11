@@ -1,6 +1,15 @@
 import React from 'react'
 import { ModelEntry } from '../components/ContentSidebar'
-import { MetadataResponse, SavedQuery } from '../lib/api'
+import { MetadataResponse, QueryCondition, QueryFilterGroup, SavedQuery } from '../lib/api'
+import {
+  inputToValue,
+  mapConditions,
+  operationLabel,
+  validateInput,
+  valuePlaceholder,
+  valueToInput,
+  visitConditions,
+} from '../lib/filters'
 import './WorkspacePages.css'
 
 interface ModelField {
@@ -43,12 +52,14 @@ interface HistoryItem {
   duration: string
   status: 'ok' | 'cached' | 'draft' | 'failed'
   queryPayload?: Record<string, unknown>
+  appLabel?: string
 }
 
 interface HistoryPageProps {
   historyItems: HistoryItem[]
   onReplayQuery: (query: HistoryItem) => void
-  onSaveQuery: (query: HistoryItem) => Promise<void>
+  /** takenNames is shared across a bulk save so generated names stay unique. */
+  onSaveQuery: (query: HistoryItem, takenNames?: Set<string>) => Promise<void>
 }
 
 
@@ -450,7 +461,12 @@ export const ModelsPage: React.FC<ModelsPageProps> = ({
   )
 }
 
-export const HistoryPage: React.FC<HistoryPageProps> = ({ historyItems, onReplayQuery, onSaveQuery }) => {
+export const HistoryPage: React.FC<HistoryPageProps & { savedQueryNames?: string[] }> = ({
+  historyItems,
+  onReplayQuery,
+  onSaveQuery,
+  savedQueryNames,
+}) => {
   const [search, setSearch] = React.useState('')
   const [selectedIds, setSelectedIds] = React.useState<Array<string | number>>([])
 
@@ -487,11 +503,12 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({ historyItems, onReplay
                 className="btn btn-secondary"
                 title="Save all selected history entries as saved queries"
                 onClick={async () => {
-                  await Promise.all(
-                    filteredItems
-                      .filter((item) => selectedIds.includes(item.id))
-                      .map((item) => onSaveQuery(item)),
-                  )
+                  // Sequential, sharing one name set: parallel saves of
+                  // entries with the same title collided on the unique name.
+                  const takenNames = new Set<string>(savedQueryNames ?? [])
+                  for (const item of filteredItems.filter((entry) => selectedIds.includes(entry.id))) {
+                    await onSaveQuery(item, takenNames)
+                  }
                   setSelectedIds([])
                 }}
               >
@@ -617,11 +634,74 @@ export const SavedQueriesPage: React.FC<SavedQueriesPageProps> = ({
   const [activeName, setActiveName] = React.useState(activeQuery?.name || '')
   const [activeDescription, setActiveDescription] = React.useState(activeQuery?.description || '')
   const [selectedIds, setSelectedIds] = React.useState<number[]>([])
+  const [isEditingParams, setIsEditingParams] = React.useState(false)
+  const [paramDrafts, setParamDrafts] = React.useState<Record<string, string>>({})
+  const [paramsSaving, setParamsSaving] = React.useState(false)
 
+  // Depend on id/updated_at, not the object: App re-creates the query objects
+  // on every render, which used to wipe in-progress edits (e.g. on a toast).
   React.useEffect(() => {
     setActiveName(activeQuery?.name || '')
     setActiveDescription(activeQuery?.description || '')
-  }, [activeQuery])
+    setIsEditingParams(false)
+    setParamDrafts({})
+  }, [activeQuery?.id, activeQuery?.updated_at])
+
+  const payload = (activeQuery?.query_payload || {}) as {
+    filter_fields?: QueryFilterGroup
+    having?: QueryFilterGroup
+  }
+  const parameters = React.useMemo(() => {
+    const items: Array<{ key: string; section: 'WHERE' | 'HAVING'; condition: QueryCondition }> = []
+    visitConditions(payload.filter_fields, (condition, path) =>
+      items.push({ key: `filter_fields:${path}`, section: 'WHERE', condition }),
+    )
+    visitConditions(payload.having, (condition, path) =>
+      items.push({ key: `having:${path}`, section: 'HAVING', condition }),
+    )
+    return items
+  }, [payload.filter_fields, payload.having])
+
+  const draftFor = (key: string, condition: QueryCondition) =>
+    paramDrafts[key] ?? valueToInput(condition.value)
+
+  const paramErrors = parameters
+    .map(({ key, condition }) => {
+      const issue = validateInput(condition.op, draftFor(key, condition))
+      return issue ? `${condition.field}: ${issue}` : null
+    })
+    .filter((issue): issue is string => issue !== null)
+
+  const startEditingParams = () => {
+    setParamDrafts(
+      Object.fromEntries(parameters.map(({ key, condition }) => [key, valueToInput(condition.value)])),
+    )
+    setIsEditingParams(true)
+  }
+
+  const saveParams = async () => {
+    if (!activeQuery || paramErrors.length > 0) return
+    const applyDrafts = (prefix: string) => (condition: QueryCondition, path: string) => {
+      const draft = paramDrafts[`${prefix}:${path}`]
+      return draft === undefined ? condition : { ...condition, value: inputToValue(condition.op, draft) }
+    }
+    const nextPayload: Record<string, unknown> = { ...activeQuery.query_payload }
+    if (payload.filter_fields) {
+      nextPayload.filter_fields = mapConditions(payload.filter_fields, applyDrafts('filter_fields'))
+    }
+    if (payload.having) {
+      nextPayload.having = mapConditions(payload.having, applyDrafts('having'))
+    }
+    setParamsSaving(true)
+    try {
+      await onUpdateSavedQuery(activeQuery.id, { query_payload: nextPayload })
+      setIsEditingParams(false)
+    } catch {
+      // the error toast is shown by the caller; keep the editor open
+    } finally {
+      setParamsSaving(false)
+    }
+  }
 
   React.useEffect(() => {
     setSelectedIds((current) => current.filter((id) => savedQueries.some((item) => item.id === id)))
@@ -705,13 +785,76 @@ export const SavedQueriesPage: React.FC<SavedQueriesPageProps> = ({
                       onClick={() => void onUpdateSavedQuery(activeQuery.id, {
                         name: activeName.trim(),
                         description: activeDescription.trim(),
-                      })}
+                      }).catch(() => undefined)}
                     >
                       Update
                     </button>
                     <button className="btn btn-ghost" title="Load this query in the Query Builder" onClick={() => onOpenInBuilder(activeQuery)}>Open in Builder</button>
                     <button className="btn btn-ghost" title="Execute this saved query now" onClick={() => void onRunSavedQuery(activeQuery)}>Run</button>
                     <button className="btn btn-danger" title="Permanently delete this saved query" onClick={() => void onDeleteSavedQuery(activeQuery.id)}>Delete</button>
+                  </div>
+                  <div className="saved-query-params">
+                    <div className="saved-query-params-head">
+                      <div className="docs-h2">Filter parameters</div>
+                      {parameters.length > 0 && !isEditingParams && (
+                        <button
+                          className="btn btn-ghost mini"
+                          type="button"
+                          title="Edit the filter values of this saved query"
+                          onClick={startEditingParams}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                    {parameters.length === 0 ? (
+                      <div className="field-hint">This query has no filter parameters.</div>
+                    ) : (
+                      <div className="saved-query-param-list">
+                        {parameters.map(({ key, section, condition }) => (
+                          <div key={key} className="saved-query-param-row">
+                            <span className="saved-query-param-section">{section}</span>
+                            <span className="saved-query-param-field">{condition.field}</span>
+                            <span className="saved-query-param-op">{operationLabel(condition.op)}</span>
+                            {isEditingParams ? (
+                              <input
+                                className="setting-input saved-query-param-input"
+                                value={draftFor(key, condition)}
+                                placeholder={valuePlaceholder(condition.op)}
+                                aria-label={`Value for ${condition.field}`}
+                                onChange={(event) =>
+                                  setParamDrafts((current) => ({ ...current, [key]: event.target.value }))
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') void saveParams()
+                                  if (event.key === 'Escape') setIsEditingParams(false)
+                                }}
+                              />
+                            ) : (
+                              <span className="saved-query-param-value">{valueToInput(condition.value)}</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {isEditingParams && (
+                      <>
+                        {paramErrors.length > 0 && <div className="query-error">{paramErrors[0]}</div>}
+                        <div className="saved-query-actions">
+                          <button
+                            className="btn btn-primary"
+                            type="button"
+                            disabled={paramsSaving || paramErrors.length > 0}
+                            onClick={() => void saveParams()}
+                          >
+                            {paramsSaving ? 'Saving…' : 'Save parameters'}
+                          </button>
+                          <button className="btn btn-ghost" type="button" onClick={() => setIsEditingParams(false)}>
+                            Cancel
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                   <div className="saved-query-payload">
                     <div className="docs-h2">Payload</div>

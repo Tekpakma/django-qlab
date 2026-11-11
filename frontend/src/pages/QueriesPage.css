@@ -876,3 +876,37 @@ tbody tr.selected td:first-child { border-left: 2px solid var(--accent); padding
     justify-content: flex-end;
   }
 }
+
+/* ── HAVING (filter on aggregated values) ───────────────────────────────── */
+.having-section { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; padding-left: 12px; border-left: 2px solid var(--accent-dim); }
+.having-row .having-alias { min-width: 140px; }
+.having-row .having-alias .dropdown-trigger { width: 100%; justify-content: space-between; }
+.aggregation-warning { color: var(--warn); }
+
+.query-notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(217, 164, 65, 0.3);
+  border-radius: 6px;
+  background: rgba(217, 164, 65, 0.07);
+  color: var(--warn);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+}
+
+.order-pill { cursor: pointer; }
+.order-pill:hover { color: var(--text); border-color: var(--accent); }
+
+/* ── Typed filter values ─────────────────────────────────────────────────── */
+.fval.invalid {
+  border-color: rgba(229, 72, 77, 0.65) !important;
+  box-shadow: 0 0 0 1px rgba(229, 72, 77, 0.25);
+}
+.fval-error {
+  flex-basis: 100%;
+  color: #ff9b9e;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.66rem;
+  padding-left: 2px;
+}
+.fval-bool { min-width: 120px; }

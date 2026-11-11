@@ -23,6 +23,10 @@ Inspect model data, run filtered queries, save and replay them — no custom vie
 
 ---
 
+> **Upgrading to 0.5.0?** Run `migrate`, check the model registry and read the
+> [upgrade notes](docs/release-notes-v0.5.0.md#upgrade-notes) — especially if
+> you scope querysets with a custom ViewSet.
+
 ## Install
 
 ```bash
@@ -113,15 +117,19 @@ class ScopedQLabViewSet(QLabFrontendApiViewSet):
         return model.objects.filter(tenant=self.request.user.tenant)
 ```
 
-Then mount the scoped ViewSet before the default `qlab.urls` include:
+Then point QLab at it — every endpoint that reads model data (query,
+export, metadata, suggest, neighborhood and saved-query runs) uses it:
 
 ```python
-urlpatterns = [
-    path("qlab/", SecuredQLabView.as_view(), name="qlab"),
-    path("qlab/api/query/", ScopedQLabViewSet.as_view({"post": "post"}), name="qlab-query"),
-    path("qlab/", include("qlab.urls")),
-]
+# settings.py
+QLAB_SETTINGS = {
+    "QUERY_VIEWSET": "myapp.views.ScopedQLabViewSet",
+}
 ```
+
+> Mounting the scoped ViewSet only on `api/query/` (the previous approach)
+> leaves `api/query/export/` and `api/saved-queries/<id>/run/` unscoped.
+> Use `QUERY_VIEWSET` instead.
 
 ---
 
@@ -138,6 +146,12 @@ QLAB_SETTINGS = {
     "MAX_RELATION_DEPTH": 2,        # how deep relation graphs expand
     "MAX_FILTER_CONDITIONS": 10,    # max filter nodes per query
     "MAX_ORDER_FIELDS": 3,          # max order_by entries
+    "MAX_AGGREGATIONS": 10,         # max aggregations per query
+    "MAX_EXPORT_ROWS": 100000,      # cap for "export all" downloads
+    "MAX_SHARE_PAYLOAD_BYTES": 65536,  # max size of a shared query payload
+    "QUERY_VIEWSET": "qlab.api_views.QLabFrontendApiViewSet",  # scoped ViewSet
+    "EXCLUDED_FIELDS": None,        # "app.Model.field" never exposed; None = user password
+    "HISTORY_RETENTION": 1000,      # run history kept per user; 0 = keep all
     "MAX_IN_VALUES": 200,           # max values in an in/not_in/between list
     "DEFAULT_COUNT_MODE": "exact",  # exact | estimate | none
     "COUNT_ESTIMATE_THRESHOLD": 10000,  # below this, estimates are counted exactly
@@ -160,6 +174,9 @@ All routes are mounted relative to the prefix you chose (e.g. `/qlab/`):
 | `GET` | `/` | Bundled React UI |
 | `GET` | `/api/bootstrap/` | Initial data load (models, settings) |
 | `POST` | `/api/query/` | Run a filtered, sorted, paginated query |
+| `POST` | `/api/query/export/` | Export all rows of a query as CSV or JSON (streamed) |
+| `POST` | `/api/shares/` | Store a query and get a short share token |
+| `GET` | `/api/shares/<token>/` | Resolve a share token |
 | `POST` | `/api/suggest/` | Typeahead: distinct values of a field, cursor paged |
 | `POST` | `/api/metadata/` | Model field and relation schema |
 | `POST` | `/api/neighborhood/` | Relation graph for a set of records |
@@ -221,6 +238,53 @@ pagination stays stable.
 { "model": "Device", "select_fields": ["id", "name"], "order_by": ["-created", "name"] }
 ```
 
+### Aggregations and HAVING
+
+`select_fields` act as the GROUP BY columns. Each aggregation is computed per
+group and returned under its `alias` (default `{function}_{field}`, or
+`count` for a field-less count). `count` may omit `field` to count the rows
+of each group; `sum`, `avg`, `min` and `max` require a field (`sum`/`avg`
+a numeric one).
+
+`having` filters the groups by their aggregated values (SQL HAVING). It takes
+the same AND/OR/NOT tree as `filter_fields`, but each condition references an
+aggregation alias. Allowed operators: `is`, `is_not`, `lt`, `lte`, `gt`,
+`gte`, `between`, `in`, `not_in`. `filter_fields` still filter rows *before*
+grouping.
+
+```json
+{
+  "model": "Device",
+  "select_fields": ["team__name", "status"],
+  "aggregations": [
+    { "function": "count", "alias": "total" },
+    { "field": "size", "function": "avg", "alias": "avg_size" }
+  ],
+  "having": { "and_operation": [{ "field": "total", "op": "gte", "value": "10" }] },
+  "order_by": ["-total"]
+}
+```
+
+```json
+{ "results": [{ "team__name": "Ops", "status": "running", "total": 42, "avg_size": 14.3 }] }
+```
+
+### Export all rows
+
+`POST /api/query/export/` takes the same payload as `/api/query/` plus
+`"format": "csv" | "json"` and streams **every** row instead of one page
+(`page`/`page_size` are ignored). At most `MAX_EXPORT_ROWS` rows are written;
+the `X-QLab-Truncated` header is `true` when the export was cut off, and
+`X-QLab-Total-Count` holds the full count. The UI's **Export all** button uses
+this endpoint.
+
+### Share links
+
+The UI's **Share** button stores the current query server side
+(`POST /api/shares/`) and copies a short `?share=<token>` link, so queries of
+any size can be shared. Whoever opens the link runs the query with their own
+permissions and queryset scoping.
+
 ### Count modes
 
 Counting every match is the expensive part of paginating large tables. Set
@@ -255,9 +319,11 @@ contains matching).
 ## UI capabilities
 
 - **Dashboard** — model counts, saved query count and recent activity
-- **Query builder** — field picker, nested `(a or b) and (x or y)` filter groups, CSV export, JSON copy
+- **Query builder** — field picker, nested `(a or b) and (x or y)` filter groups, operators per field type (incl. `in`/`between`), aggregations with HAVING, server-side sorting across pages
+- **Export** — current page as CSV, or **Export all** rows (CSV) in one download
+- **Share** — short share links that work for large queries
 - **Models browser** — field types, nullability, filterable flags, relation inspection
-- **Saved queries** — create, update, delete, bulk delete and run from the UI
+- **Saved queries** — create, update, delete, bulk delete and run from the UI; edit filter values inline in the Saved tab
 - **History** — replay past runs, save from history, filter by model and time range
 - **Settings** — page size, default app, theme
 - **Light and dark mode**
@@ -273,6 +339,7 @@ The package registers the following models in Django admin:
 | `QLabUserSettings` | Per-user theme, page size and active tab |
 | `SavedQuery` | Stored query payloads with metadata |
 | `QueryRunHistory` | Execution log with status, duration and result snapshot |
+| `SharedQuery` | Query payloads behind share-link tokens |
 
 ---
 

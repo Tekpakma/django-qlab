@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Dialog, DialogPanel, DialogTitle } from '@headlessui/react'
 import {
   AggregationFunction,
+  ExportFormat,
+  ExportResult,
   MetadataField,
   MetadataResponse,
   QueryCondition,
@@ -9,10 +11,23 @@ import {
   QueryRequest,
   QueryResponse,
 } from '../lib/api'
+import {
+  ALL_OPERATIONS,
+  HAVING_OPERATIONS,
+  decodeBase64Url,
+  encodeBase64Url,
+  inputToValue,
+  isBooleanType,
+  operationLabel,
+  typedPlaceholder,
+  validateTypedInput,
+  valueToInput,
+  visitConditions,
+} from '../lib/filters'
 import { setUrlParam } from '../lib/url'
 import './QueriesPage.css'
 
-type FilterOp = 'is' | 'is_not' | 'icontains' | 'lt' | 'lte' | 'gt' | 'gte'
+type FilterOp = string
 type FilterJoiner = 'and' | 'or'
 
 interface FilterConditionNode {
@@ -33,7 +48,7 @@ interface FilterGroupNode {
 type FilterNode = FilterConditionNode | FilterGroupNode
 
 interface ResultRow {
-  [key: string]: string | number | boolean | null
+  [key: string]: unknown
 }
 
 type ResultTab = 'table' | 'json'
@@ -76,16 +91,6 @@ const RELATION_TYPES = new Set([
   'reverse_relation',
 ])
 
-const DEFAULT_OPERATIONS: FilterOp[] = [
-  'is',
-  'is_not',
-  'icontains',
-  'lt',
-  'lte',
-  'gt',
-  'gte',
-]
-
 const AGGREGATION_FUNCTIONS: AggregationFunction[] = ['count', 'sum', 'avg', 'min', 'max']
 
 interface AggregationRow {
@@ -94,6 +99,34 @@ interface AggregationRow {
   function: AggregationFunction
   distinct: boolean
   alias: string
+}
+
+interface HavingRow {
+  id: string
+  alias: string
+  op: FilterOp
+  value: string
+}
+
+const aggregationAlias = (row: Pick<AggregationRow, 'alias' | 'field' | 'function'>) =>
+  row.alias.trim() || (row.field.trim() ? `${row.function}_${row.field.trim()}` : row.function)
+
+// Longer encoded filters are not mirrored into the address bar: very long URLs
+// get rejected by proxies/servers (414) and truncated by chat tools. Sharing
+// uses short server-side links instead (see handleShare).
+const MAX_URL_FILTER_LENGTH = 1500
+
+function readUrlFilters(): QueryFilterGroup | undefined {
+  const urlFilters = new URLSearchParams(window.location.search).get('filters')
+  if (!urlFilters) return undefined
+  for (const decode of [decodeBase64Url, (value: string) => atob(value)]) {
+    try {
+      return JSON.parse(decode(urlFilters)) as QueryFilterGroup
+    } catch {
+      // try the next (legacy) encoding
+    }
+  }
+  return undefined
 }
 
 const splitIdentifier = (value: string) =>
@@ -224,7 +257,7 @@ function toCondition(node: FilterConditionNode): QueryCondition {
   return {
     field: node.field,
     op: node.op,
-    value: node.value,
+    value: inputToValue(node.op, node.value),
   }
 }
 
@@ -271,8 +304,8 @@ function deserializeFilters(
         id: newId(),
         type: 'condition',
         field: node.field,
-        op: (node.op as FilterOp) || 'is',
-        value: String(node.value ?? ''),
+        op: node.op || 'is',
+        value: valueToInput(node.value),
       }
     }
 
@@ -731,6 +764,20 @@ interface ConditionRowProps {
   onRequestMetadata: (modelName: string, appLabel?: string) => Promise<MetadataResponse>
 }
 
+function operationsForField(metadata: MetadataResponse | undefined, fieldPath: string, currentOp: string) {
+  const known = metadata?.fields.find((field) => field.name === fieldPath)?.allowed_operations
+  // Paths deeper than the loaded metadata are validated by the backend.
+  const ops: string[] = known && known.length > 0 ? [...known] : [...ALL_OPERATIONS]
+  if (currentOp && !ops.includes(currentOp)) {
+    ops.push(currentOp)
+  }
+  return ops
+}
+
+function fieldTypeOf(metadata: MetadataResponse | undefined, fieldPath: string) {
+  return metadata?.fields.find((field) => field.name === fieldPath)?.type
+}
+
 const ConditionRow: React.FC<ConditionRowProps> = ({
   node,
   rootModel,
@@ -739,7 +786,11 @@ const ConditionRow: React.FC<ConditionRowProps> = ({
   onChange,
   onRemove,
   onRequestMetadata,
-}) => (
+}) => {
+  const fieldType = fieldTypeOf(rootMetadata, node.field)
+  const problem = node.value.trim() ? validateTypedInput(fieldType, node.op, node.value) : null
+  const booleanChoice = isBooleanType(fieldType) && (node.op === 'is' || node.op === 'is_not')
+  return (
   <div className="filter-row">
     <FieldAutocomplete
       value={node.field}
@@ -755,20 +806,40 @@ const ConditionRow: React.FC<ConditionRowProps> = ({
     <Dropdown
       className="dropdown-op"
       value={node.op}
-      options={DEFAULT_OPERATIONS.map((operation) => ({
+      options={operationsForField(rootMetadata, node.field, node.op).map((operation) => ({
         value: operation,
-        label: operation === 'is_not' ? 'is not' : operation,
+        label: operationLabel(operation),
       }))}
       onChange={(op) => onChange(node.id, { op })}
     />
 
-    <input
-      className="fval"
-      type="text"
-      placeholder="value…"
-      value={node.value}
-      onChange={(event) => onChange(node.id, { value: event.target.value })}
-    />
+    {booleanChoice ? (
+      <Dropdown
+        className="dropdown-op fval-bool"
+        value={node.value === 'false' ? 'false' : node.value === 'true' ? 'true' : ''}
+        options={[
+          ...(node.value === 'true' || node.value === 'false' ? [] : [{ value: '', label: 'choose…' }]),
+          { value: 'true', label: 'true' },
+          { value: 'false', label: 'false' },
+        ]}
+        onChange={(value) => onChange(node.id, { value })}
+      />
+    ) : (
+      <input
+        className={`fval${problem ? ' invalid' : ''}`}
+        type="text"
+        inputMode={
+          fieldType && ['integer', 'bigint', 'smallint', 'positiveint'].includes(fieldType) && !['between', 'in', 'not_in'].includes(node.op)
+            ? 'numeric'
+            : undefined
+        }
+        placeholder={typedPlaceholder(fieldType, node.op)}
+        value={node.value}
+        aria-invalid={Boolean(problem)}
+        title={problem ? `${node.field} ${problem}` : undefined}
+        onChange={(event) => onChange(node.id, { value: event.target.value })}
+      />
+    )}
 
     <button
       className="remove-btn"
@@ -778,8 +849,10 @@ const ConditionRow: React.FC<ConditionRowProps> = ({
     >
       ×
     </button>
+    {problem && <div className="fval-error">{node.field} {problem}</div>}
   </div>
-)
+  )
+}
 
 interface FilterGroupEditorProps {
   node: FilterGroupNode
@@ -898,6 +971,9 @@ const FilterGroupEditor: React.FC<FilterGroupEditorProps> = ({
   </div>
 )
 
+const formatCell = (value: unknown) =>
+  value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
+
 const ResultsTable: React.FC<{
   rows: ResultRow[]
   selectedRow: number | null
@@ -946,7 +1022,7 @@ const ResultsTable: React.FC<{
                         : 'td-plain'
                   }
                 >
-                  {String(row[column] ?? '')}
+                  {formatCell(row[column])}
                 </td>
               ))}
             </tr>
@@ -1003,6 +1079,8 @@ interface QueriesPageProps {
   }) => Promise<void>
   onRequestMetadata: (modelName: string, appLabel?: string) => Promise<MetadataResponse>
   onRunQuery: (payload: QueryRequest) => Promise<QueryResponse>
+  onExportQuery?: (payload: QueryRequest, format: ExportFormat) => Promise<ExportResult>
+  onShareQuery?: (payload: QueryRequest) => Promise<string>
 }
 
 export const QueriesPage: React.FC<QueriesPageProps> = ({
@@ -1019,6 +1097,8 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
   onSaveQuery,
   onRequestMetadata,
   onRunQuery,
+  onExportQuery,
+  onShareQuery,
 }) => {
   const directFields = useMemo(() => getDirectFields(activeMetadata), [activeMetadata])
   const directFieldNames = useMemo(
@@ -1029,16 +1109,24 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     () => new Set(activeMetadata?.all_lookups || directFieldNames),
     [activeMetadata, directFieldNames],
   )
+  // all_lookups only goes as deep as the metadata relation depth; deeper paths
+  // (e.g. from saved queries) are still valid if they start at a direct field —
+  // the backend validates the rest. Dropping them silently changed queries.
+  const isKnownPath = useMemo(() => {
+    const direct = new Set(directFieldNames)
+    return (path: string) =>
+      validLookupNames.has(path) || (path.includes('__') && direct.has(path.split('__')[0]))
+  }, [directFieldNames, validLookupNames])
   const fallbackField = directFieldNames[0] || 'id'
   const hasAppliedPreset = useRef(false)
 
   const [filters, setFilters] = useState<FilterGroupNode>(() => {
-    const urlFilters = new URLSearchParams(window.location.search).get('filters')
+    const urlFilters = readUrlFilters()
     if (urlFilters) {
       try {
-        return deserializeFilters(JSON.parse(atob(urlFilters)) as QueryFilterGroup, fallbackField)
+        return deserializeFilters(urlFilters, fallbackField)
       } catch {
-        // malformed/legacy share link — fall back to an empty filter group below
+        // malformed link — fall back to an empty filter group below
       }
     }
     return newGroup(fallbackField, 'and')
@@ -1048,19 +1136,25 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
   const [error, setError] = useState<string | null>(null)
   const [resultTab, setResultTab] = useState<ResultTab>('table')
   const [selectedRow, setSelectedRow] = useState<number | null>(null)
-  const [sortField, setSortField] = useState('id')
+  // sortField === '' means "keep the server order".
+  const [sortField, setSortField] = useState('')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+  const [orderBy, setOrderBy] = useState<string[]>([])
   const [results, setResults] = useState<QueryResponse | null>(null)
   const [selectedFields, setSelectedFields] = useState<string[]>(() => {
     const urlFields = new URLSearchParams(window.location.search).get('fields')
     return urlFields ? urlFields.split(',').filter(Boolean) : []
   })
   const [aggregations, setAggregations] = useState<AggregationRow[]>([])
+  const [havingRows, setHavingRows] = useState<HavingRow[]>([])
+  const [exportState, setExportState] = useState<'idle' | 'working' | 'done'>('idle')
+  const [notice, setNotice] = useState<string | null>(null)
+  const lastRunPayload = useRef<QueryRequest | null>(null)
   const [isFieldPickerOpen, setIsFieldPickerOpen] = useState(false)
   const [fieldSearch, setFieldSearch] = useState('')
   const [copyState, setCopyState] = useState<'idle' | 'done' | 'error'>('idle')
   const [csvState, setCsvState] = useState<'idle' | 'done'>('idle')
-  const [shareState, setShareState] = useState<'idle' | 'done'>('idle')
+  const [shareState, setShareState] = useState<'idle' | 'working' | 'done' | 'error'>('idle')
   const [lastRunAt, setLastRunAt] = useState<Date | null>(null)
   const [relativeTime, setRelativeTime] = useState('')
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
@@ -1089,7 +1183,7 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     }
 
     setSelectedFields((current) => {
-      const next = current.filter((field) => validLookupNames.has(field))
+      const next = current.filter((field) => isKnownPath(field))
       if (next.length > 0) {
         return next
       }
@@ -1103,12 +1197,12 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
         }
         return {
           ...node,
-          field: node.field && validLookupNames.has(node.field) ? node.field : fallbackField,
+          field: node.field && isKnownPath(node.field) ? node.field : fallbackField,
         }
       }
       return normalizeNode(current) as FilterGroupNode
     })
-  }, [activeModel, activeMetadata, directFieldNames, fallbackField, validLookupNames])
+  }, [activeModel, activeMetadata, directFieldNames, fallbackField, isKnownPath])
 
   useEffect(() => {
     if (selectedFields.length === 0) return
@@ -1117,11 +1211,8 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
 
   useEffect(() => {
     const serialized = serializeFilters(filters)
-    if (serialized) {
-      setUrlParam('filters', btoa(JSON.stringify(serialized)))
-    } else {
-      setUrlParam('filters', null)
-    }
+    const encoded = serialized ? encodeBase64Url(JSON.stringify(serialized)) : ''
+    setUrlParam('filters', encoded && encoded.length <= MAX_URL_FILTER_LENGTH ? encoded : null)
   }, [filters])
 
   useEffect(() => {
@@ -1142,6 +1233,27 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     setPresetTitle(queryPreset.title ?? null)
     setFilters(deserializeFilters(queryPreset.filter_fields, fallbackField))
     setLimit(queryPreset.page_size || defaultPageSize || 100)
+    setAggregations(
+      (queryPreset.aggregations || []).map((agg) => ({
+        id: newId(),
+        field: agg.field || '',
+        function: agg.function,
+        distinct: Boolean(agg.distinct),
+        alias: agg.alias || '',
+      })),
+    )
+    const presetHaving: HavingRow[] = []
+    visitConditions(queryPreset.having, (condition) => {
+      presetHaving.push({
+        id: newId(),
+        alias: condition.field,
+        op: condition.op,
+        value: valueToInput(condition.value),
+      })
+    })
+    setHavingRows(presetHaving)
+    setOrderBy(queryPreset.order_by || [])
+    setSortField('')
     setSelectedFields(
       queryPreset.select_fields?.length
         ? queryPreset.select_fields
@@ -1150,9 +1262,9 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
 
     if (resultsPreset) {
       setResults(resultsPreset)
+      lastRunPayload.current = queryPreset
       setLastRunAt(new Date())
       setSelectedRow(null)
-      setSortField(Object.keys(resultsPreset.results[0] || {})[0] || 'id')
       onPresetApplied?.()
       onResultsPresetApplied?.()
       hasAppliedPreset.current = false
@@ -1309,13 +1421,99 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     return walk(filters)
   }, [filters])
 
+  // count/sum/avg results are numbers; min/max have the type of their field.
+  const havingTypeOf = (alias: string) => {
+    const agg = aggregations.find((row) => aggregationAlias(row) === alias)
+    if (!agg) return undefined
+    if (agg.function === 'count') return 'integer'
+    if (agg.function === 'sum' || agg.function === 'avg') return 'float'
+    return fieldTypeOf(activeMetadata, agg.field.trim())
+  }
+
+  const filterProblem = useMemo(() => {
+    let problem: string | null = null
+    const walk = (node: FilterNode) => {
+      if (problem) return
+      if (node.type === 'condition') {
+        const issue = validateTypedInput(fieldTypeOf(activeMetadata, node.field), node.op, node.value)
+        if (issue && node.value.trim()) problem = `${node.field} ${issue}`
+        return
+      }
+      node.children.forEach(walk)
+    }
+    walk(filters)
+    havingRows.forEach((row) => {
+      if (problem || !row.value.trim()) return
+      const issue = validateTypedInput(havingTypeOf(row.alias), row.op, row.value)
+      if (issue) problem = `${row.alias} ${issue}`
+    })
+    return problem
+  }, [filters, havingRows, activeMetadata, aggregations])
+
   const handleSort = (field: string) => {
-    if (sortField === field) {
-      setSortDir((current) => (current === 'asc' ? 'desc' : 'asc'))
+    const nextDir: 'asc' | 'desc' = sortField === field && sortDir === 'asc' ? 'desc' : 'asc'
+    const multiPage = Boolean(results && (results.next !== null || results.previous !== null))
+
+    if (!multiPage) {
+      // Everything is on screen — sort locally.
+      setSortField(field)
+      setSortDir(nextDir)
       return
     }
-    setSortField(field)
-    setSortDir('asc')
+
+    // Results span several pages: sorting only the visible page would be
+    // misleading, so ask the backend to order the whole result set.
+    const previousOrder = orderBy
+    const nextOrder = [`${nextDir === 'desc' ? '-' : ''}${field}`]
+    setOrderBy(nextOrder)
+    void handleRunQuery({
+      page: 1,
+      overrides: { order_by: nextOrder },
+      keepResultsOnError: true,
+      continueLast: true,
+    }).then((ok) => {
+      if (ok) {
+        setSortField(field)
+        setSortDir(nextDir)
+      } else {
+        setOrderBy(previousOrder)
+      }
+    })
+  }
+
+  const isAggregating = aggregations.some((row) => row.field.trim() || row.function === 'count')
+
+  // Grouping by a unique field (pk or unique=True) makes every group a single
+  // row — almost never what someone building an aggregation wants.
+  const groupsByUniqueField = useMemo(() => {
+    const pk = activeMetadata?.primary_key_field || 'id'
+    return (
+      selectedFields.find(
+        (field) =>
+          field === pk ||
+          activeMetadata?.fields.some((meta) => meta.name === field && (meta.unique || meta.primary_key)),
+      ) || null
+    )
+  }, [activeMetadata, selectedFields])
+
+  const activeAliases = useMemo(
+    () => aggregations.filter((row) => row.field.trim() || row.function === 'count').map(aggregationAlias),
+    [aggregations],
+  )
+
+  const addHavingRow = () => {
+    setHavingRows((current) => [
+      ...current,
+      { id: newId(), alias: activeAliases[0] || '', op: 'gt', value: '' },
+    ])
+  }
+
+  const updateHavingRow = (id: string, patch: Partial<HavingRow>) => {
+    setHavingRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)))
+  }
+
+  const removeHavingRow = (id: string) => {
+    setHavingRows((current) => current.filter((row) => row.id !== id))
   }
 
   const addAggregation = () => {
@@ -1333,28 +1531,43 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     setAggregations((current) => current.filter((row) => row.id !== id))
   }
 
-  const buildPayload = (page: number): QueryRequest => ({
-    model: activeModel,
-    ...(activeAppLabel ? { app_label: activeAppLabel } : {}),
-    select_fields: selectedFields.length > 0 ? selectedFields : ['id'],
-    filter_fields: serializeFilters(filters),
-    ...(aggregations.some((row) => row.field.trim())
-      ? {
-          aggregations: aggregations
-            .filter((row) => row.field.trim())
-            .map((row) => ({
-              field: row.field,
+  const buildPayload = (page: number, overrides: Partial<QueryRequest> = {}): QueryRequest => {
+    const activeAggregations = aggregations.filter(
+      (row) => row.field.trim() || row.function === 'count',
+    )
+    const havingConditions = activeAggregations.length
+      ? havingRows
+          .filter((row) => row.alias && row.value.trim())
+          .map((row) => ({
+            field: row.alias,
+            op: row.op,
+            value: inputToValue(row.op, row.value),
+          }))
+      : []
+    return {
+      model: activeModel,
+      ...(activeAppLabel ? { app_label: activeAppLabel } : {}),
+      select_fields: selectedFields.length > 0 ? selectedFields : ['id'],
+      filter_fields: serializeFilters(filters),
+      ...(activeAggregations.length
+        ? {
+            aggregations: activeAggregations.map((row) => ({
+              ...(row.field.trim() ? { field: row.field.trim() } : {}),
               function: row.function,
               distinct: row.distinct,
               ...(row.alias.trim() ? { alias: row.alias.trim() } : {}),
             })),
-        }
-      : {}),
-    page,
-    page_size: limit,
-    title: presetTitle || `${activeModelLabel || activeModel} query`,
-    ...(savedQueryId ? { saved_query_id: savedQueryId } : {}),
-  })
+          }
+        : {}),
+      ...(havingConditions.length ? { having: { and_operation: havingConditions } } : {}),
+      ...(orderBy.length ? { order_by: orderBy } : {}),
+      page,
+      page_size: limit,
+      title: presetTitle || `${activeModelLabel || activeModel} query`,
+      ...(savedQueryId ? { saved_query_id: savedQueryId } : {}),
+      ...overrides,
+    }
+  }
 
   const openSaveDialog = () => {
     setSaveName(presetTitle || `${activeModelLabel || activeModel} query`)
@@ -1371,27 +1584,57 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
   const handleRunQuery = async ({
     page = 1,
     explicitPayload,
+    overrides,
+    keepResultsOnError = false,
+    continueLast = false,
   }: {
     page?: number
     explicitPayload?: QueryRequest
-  } = {}) => {
-    if (!explicitPayload && hasIncompleteFilters) {
+    overrides?: Partial<QueryRequest>
+    keepResultsOnError?: boolean
+    /** Page/sort the query whose results are on screen instead of the builder state. */
+    continueLast?: boolean
+  } = {}): Promise<boolean> => {
+    const continuing = continueLast && lastRunPayload.current !== null
+    if (!explicitPayload && !continuing && hasIncompleteFilters) {
       setError('Every filter rule needs a field and a value.')
-      return
+      return false
+    }
+    if (!explicitPayload && !continuing && filterProblem) {
+      setError(filterProblem)
+      return false
     }
 
     setIsLoading(true)
     setError(null)
+    setNotice(null)
+
+    // Paging through a replayed/preset query must keep its exact payload.
+    // Paging/sorting continues the query whose results are on screen, even if
+    // the builder has been edited since.
+    const basePayload =
+      explicitPayload ||
+      (continuing && lastRunPayload.current
+        ? { ...lastRunPayload.current, page, ...overrides }
+        : buildPayload(page, overrides))
 
     try {
-      const response = await onRunQuery(explicitPayload || buildPayload(page))
+      const response = await onRunQuery(basePayload)
+      lastRunPayload.current = basePayload
       setResults(response)
       setLastRunAt(new Date())
       setSelectedRow(null)
-      setSortField(Object.keys(response.results[0] || {})[0] || 'id')
+      if (!overrides?.order_by) {
+        // New data arrives in server order — don't re-sort it client-side.
+        setSortField('')
+      }
+      return true
     } catch (runError) {
-      setResults(null)
+      if (!keepResultsOnError) {
+        setResults(null)
+      }
       setError(runError instanceof Error ? runError.message : 'Query failed.')
+      return false
     } finally {
       setIsLoading(false)
     }
@@ -1420,8 +1663,13 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     const columns = Array.from(new Set(results.results.flatMap((row) => Object.keys(row))))
 
     const escapeCsvValue = (value: unknown) => {
-      const normalized = value == null ? '' : String(value)
-      if (/[",\n]/.test(normalized)) {
+      let normalized =
+        value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
+      // Neutralise spreadsheet formulas in text cells (CSV injection).
+      if (typeof value === 'string' && /^[=+\-@\t\r]/.test(normalized)) {
+        normalized = `'${normalized}`
+      }
+      if (/[",\r\n]/.test(normalized)) {
         return `"${normalized.replace(/"/g, '""')}"`
       }
       return normalized
@@ -1434,7 +1682,7 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
       ),
     ]
 
-    const blob = new Blob([csvLines.join('\n')], {
+    const blob = new Blob(['\ufeff' + csvLines.join('\n')], {
       type: 'text/csv;charset=utf-8;',
     })
     const url = URL.createObjectURL(blob)
@@ -1452,17 +1700,82 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     window.setTimeout(() => setCsvState('idle'), 1600)
   }
 
-  const handleShare = async () => {
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  const handleExportAll = async (format: ExportFormat = 'csv') => {
+    const payload = lastRunPayload.current
+    if (!onExportQuery || !payload) {
+      return
+    }
+    setExportState('working')
+    setError(null)
+    setNotice(null)
     try {
-      await navigator.clipboard.writeText(window.location.href)
+      const exported = await onExportQuery(payload, format)
+      downloadBlob(exported.blob, exported.filename)
+      if (exported.truncated) {
+        setNotice(
+          `Export limited to ${exported.exportedCount?.toLocaleString()} of ${exported.totalCount?.toLocaleString()} rows (MAX_EXPORT_ROWS).`,
+        )
+      }
+      setExportState('done')
+      window.setTimeout(() => setExportState('idle'), 1600)
+    } catch (exportError) {
+      setExportState('idle')
+      setError(exportError instanceof Error ? exportError.message : 'Export failed.')
+    }
+  }
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // Clipboard API is unavailable on insecure origins (plain http) — fall
+      // back to a prompt the user can copy from.
+      window.prompt('Copy this link:', text)
+      return true
+    }
+  }
+
+  const handleShare = async () => {
+    if (filterProblem) {
+      setError(filterProblem)
+      return
+    }
+    setShareState('working')
+    try {
+      let link = window.location.href
+      if (onShareQuery) {
+        const { title: _title, saved_query_id: _savedId, ...payload } = buildPayload(1)
+        const token = await onShareQuery(payload)
+        const params = new URLSearchParams()
+        params.set('model', activeAppLabel ? `${activeAppLabel}::${activeModel}` : activeModel)
+        params.set('share', token)
+        link = `${window.location.origin}${window.location.pathname}?${params.toString()}`
+      }
+      await copyText(link)
       setShareState('done')
       window.setTimeout(() => setShareState('idle'), 1600)
-    } catch {}
+    } catch (shareError) {
+      setShareState('error')
+      setError(shareError instanceof Error ? shareError.message : 'Could not create share link.')
+      window.setTimeout(() => setShareState('idle'), 2000)
+    }
   }
 
   const rows = (results?.results || []) as ResultRow[]
   const displayModelLabel = activeModelLabel || activeModel
-  const sortedResults = [...rows].sort((left, right) => {
+  const sortedResults = !sortField ? rows : [...rows].sort((left, right) => {
     const leftValue = left[sortField] ?? ''
     const rightValue = right[sortField] ?? ''
     const comparison = String(leftValue).localeCompare(String(rightValue), undefined, {
@@ -1471,8 +1784,12 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
     return sortDir === 'asc' ? comparison : -comparison
   })
   const paginationItems = useMemo(
-    () => buildPaginationItems(results?.page || 1, results?.total_pages || 1),
-    [results?.page, results?.total_pages],
+    () =>
+      buildPaginationItems(
+        results?.page || 1,
+        results?.total_pages ?? (results ? results.page + (results.next !== null ? 1 : 0) : 1),
+      ),
+    [results?.page, results?.total_pages, results?.next],
   )
 
   return (
@@ -1493,7 +1810,12 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
           <ResourceRow activeModel={activeModel} activeModelLabel={activeModelLabel} />
 
           <div className="field-selector">
-            <span className="from-label">SELECT</span>
+            <span
+              className="from-label"
+              title={isAggregating ? 'With aggregations, these fields define the groups (SQL GROUP BY).' : undefined}
+            >
+              {isAggregating ? 'GROUP BY' : 'SELECT'}
+            </span>
             {metadataLoading && <span className="field-hint">Loading fields…</span>}
             {!metadataLoading && directFieldNames.length === 0 && (
               <span className="field-hint">No fields available.</span>
@@ -1602,7 +1924,7 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
                 <input
                   className="aggregation-alias"
                   type="text"
-                  placeholder={`${row.function}_${row.field || 'field'}`}
+                  placeholder={aggregationAlias({ ...row, alias: '' })}
                   title="Result column name (optional)"
                   value={row.alias}
                   onChange={(event) => updateAggregation(row.id, { alias: event.target.value })}
@@ -1617,6 +1939,76 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
                 </button>
               </div>
             ))}
+            {isAggregating && (
+              <div className="field-hint">
+                One result row per unique combination of{' '}
+                <strong>{selectedFields.join(' + ') || '—'}</strong> (GROUP BY above). To count
+                rows per group, use count with an empty field.
+              </div>
+            )}
+            {isAggregating && groupsByUniqueField && (
+              <div className="field-hint aggregation-warning">
+                “{groupsByUniqueField}” is unique per row, so every row becomes its own group
+                (count is always 1). Remove it from GROUP BY to aggregate across rows.
+              </div>
+            )}
+            {activeAliases.length > 0 && (
+              <div className="having-section">
+                <div className="aggregation-header">
+                  <span className="from-label" title="Filter groups by their aggregated values (SQL HAVING)">
+                    HAVING
+                  </span>
+                  <button
+                    className="btn btn-ghost mini"
+                    type="button"
+                    title="Filter on an aggregated value"
+                    onClick={addHavingRow}
+                  >
+                    + Condition
+                  </button>
+                </div>
+                {havingRows.map((row) => {
+                  const aliasOptions = activeAliases.includes(row.alias) || !row.alias
+                    ? activeAliases
+                    : [...activeAliases, row.alias]
+                  return (
+                    <div key={row.id} className="filter-row having-row">
+                      <Dropdown
+                        className="dropdown-op having-alias"
+                        value={row.alias}
+                        options={aliasOptions.map((alias) => ({
+                          value: alias,
+                          label: activeAliases.includes(alias) ? alias : `${alias} (missing)`,
+                        }))}
+                        onChange={(alias) => updateHavingRow(row.id, { alias })}
+                      />
+                      <Dropdown
+                        className="dropdown-op"
+                        value={row.op}
+                        options={HAVING_OPERATIONS.map((op) => ({ value: op as string, label: operationLabel(op) }))}
+                        onChange={(op) => updateHavingRow(row.id, { op })}
+                      />
+                      <input
+                        className={`fval${row.value.trim() && validateTypedInput(havingTypeOf(row.alias), row.op, row.value) ? ' invalid' : ''}`}
+                        type="text"
+                        placeholder={typedPlaceholder(havingTypeOf(row.alias), row.op)}
+                        value={row.value}
+                        title={(row.value.trim() && validateTypedInput(havingTypeOf(row.alias), row.op, row.value)) || undefined}
+                        onChange={(event) => updateHavingRow(row.id, { value: event.target.value })}
+                      />
+                      <button
+                        className="remove-btn"
+                        type="button"
+                        onClick={() => removeHavingRow(row.id)}
+                        title="Remove condition"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
           </div>
 
           <div className="filter-rows">
@@ -1667,11 +2059,18 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
             )}
             <button
               className="btn btn-ghost"
-              title="Copy shareable link to this query"
+              title="Copy a short link to this query (fields, filters, aggregations, sorting)"
               onClick={() => void handleShare()}
-              disabled={directFieldNames.length === 0}
+              disabled={directFieldNames.length === 0 || shareState === 'working'}
             >
-              <IconShare /> {shareState === 'done' ? 'Copied!' : 'Share'}
+              <IconShare />{' '}
+              {shareState === 'working'
+                ? 'Sharing…'
+                : shareState === 'done'
+                  ? 'Link copied!'
+                  : shareState === 'error'
+                    ? 'Share failed'
+                    : 'Share'}
             </button>
             {filters.children.length > 0 && (
               <button
@@ -1685,6 +2084,7 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
           </div>
 
           {error && <div className="query-error">{error}</div>}
+          {notice && <div className="query-notice">{notice}</div>}
         </div>
       </div>
 
@@ -1771,11 +2171,27 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
           className="card animate-in query-results-card"
         >
           <div className="results-meta">
-            <span className="result-count">{results.count}</span>
-            <span className="result-count-label">results</span>
+            <span className="result-count">
+              {results.count === null ? '—' : `${results.count_exact === false ? '~' : ''}${results.count.toLocaleString()}`}
+            </span>
+            <span className="result-count-label">{aggregations.length > 0 && results.count !== null ? 'groups' : 'results'}</span>
             <div className="timing-pill">
               <span className="dot">●</span> {results.page_size} / page
             </div>
+            {orderBy.length > 0 && (
+              <button
+                className="timing-pill order-pill"
+                type="button"
+                title="Clear server-side sorting"
+                onClick={() => {
+                  setOrderBy([])
+                  setSortField('')
+                  void handleRunQuery({ page: 1, overrides: { order_by: [] }, keepResultsOnError: true, continueLast: true })
+                }}
+              >
+                sorted by {orderBy.map((entry) => (entry.startsWith('-') ? `${entry.slice(1)} ↓` : `${entry} ↑`)).join(', ')} ×
+              </button>
+            )}
             {lastRunAt && (
               <div className={`timing-pill${Date.now() - lastRunAt.getTime() > 5 * 60_000 ? ' stale' : ''}`}>
                 {relativeTime}
@@ -1790,9 +2206,24 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
                     ? 'Copy failed'
                     : 'JSON'}
               </button>
-              <button className="btn btn-ghost" onClick={handleExportCsv} title="Export CSV">
-                <IconDownload /> {csvState === 'done' ? 'Downloaded' : 'CSV'}
+              <button className="btn btn-ghost" onClick={handleExportCsv} title="Download the rows on this page as CSV">
+                <IconDownload /> {csvState === 'done' ? 'Downloaded' : 'Page CSV'}
               </button>
+              {onExportQuery && (
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => void handleExportAll('csv')}
+                  disabled={exportState === 'working' || !lastRunPayload.current}
+                  title={`Download all ${results.count === null ? '' : `${results.count.toLocaleString()} `}results (every page) as CSV`}
+                >
+                  <IconDownload />{' '}
+                  {exportState === 'working'
+                    ? 'Exporting…'
+                    : exportState === 'done'
+                      ? 'Downloaded'
+                      : 'Export all'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -1831,8 +2262,8 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
           <div className="pagination">
             <button
               className="ppage ppage-nav"
-              disabled={results.page <= 1}
-              onClick={() => void handleRunQuery({ page: results.page - 1 })}
+              disabled={results.previous === null}
+              onClick={() => void handleRunQuery({ page: results.page - 1, continueLast: true })}
             >
               Prev
             </button>
@@ -1845,7 +2276,7 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
                 <button
                   key={item}
                   className={`ppage${results.page === item ? ' cur' : ''}`}
-                  onClick={() => void handleRunQuery({ page: item })}
+                  onClick={() => void handleRunQuery({ page: item, continueLast: true })}
                 >
                   {item}
                 </button>
@@ -1853,14 +2284,16 @@ export const QueriesPage: React.FC<QueriesPageProps> = ({
             )}
             <button
               className="ppage ppage-nav"
-              disabled={results.page >= results.total_pages}
-              onClick={() => void handleRunQuery({ page: results.page + 1 })}
+              disabled={results.next === null}
+              onClick={() => void handleRunQuery({ page: results.page + 1, continueLast: true })}
             >
               Next
             </button>
             <span className="page-summary">
-              {(results.page - 1) * results.page_size + 1}–
-              {Math.min(results.page * results.page_size, results.count)} of {results.count}
+              {results.results.length === 0
+                ? '0'
+                : `${(results.page - 1) * results.page_size + 1}–${(results.page - 1) * results.page_size + results.results.length}`}
+              {results.count !== null ? ` of ${results.count.toLocaleString()}` : ''}
             </span>
           </div>
         </div>

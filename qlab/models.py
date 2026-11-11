@@ -96,6 +96,39 @@ class QueryRunHistory(models.Model):
         return f"{self.model_name} ({self.status})"
 
 
+class SharedQuery(models.Model):
+    """
+    A query payload stored server side behind a short token.
+
+    Share links used to carry the whole query (fields + filters) base64
+    encoded in the URL, which broke for large queries (URL length limits in
+    browsers, proxies and chat tools). Now the link only carries the token.
+    Whoever opens the link still needs access to the model — the payload is
+    run with the recipient's own permissions and queryset scoping.
+    """
+
+    token = models.CharField(max_length=32, unique=True, db_index=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="qlab_shared_queries",
+    )
+    app_label = models.CharField(max_length=128, blank=True, default="")
+    model_name = models.CharField(max_length=128)
+    query_payload = models.JSONField(default=dict)
+    payload_hash = models.CharField(max_length=64, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "QLab shared query"
+        verbose_name_plural = "QLab shared queries"
+        app_label = "qlab"
+
+    def __str__(self) -> str:
+        return f"{self.model_name} ({self.token})"
+
+
 class ModelRegistry(models.Model):
     STATUS_CHOICES = [
         ("enabled", "Enabled"),

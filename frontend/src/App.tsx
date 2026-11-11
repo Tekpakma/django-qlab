@@ -22,10 +22,14 @@ import {
   QueryResponse,
   SavedQuery,
   createSavedQuery,
+  createShare,
   deleteSavedQuery,
+  exportQuery,
   getBootstrap,
   getHistory,
   getModelMetadata,
+  getSavedQueries,
+  getShare,
   markSavedQueryRun,
   modelKey,
   patchSettings,
@@ -138,6 +142,51 @@ const DOCS_ENTRIES: DocsEntry[] = [
     code: `POST /api/query/\n{\n  "model": "Team",\n  "select_fields": ["id", "name"],\n  "aggregations": [\n    { "field": "devices", "function": "count" },\n    { "field": "devices__owner", "function": "count",\n      "distinct": true, "alias": "distinct_owners" }\n  ]\n}\n\n// result rows:\n// { "id": 1, "name": "Ops",\n//   "count_devices": 17, "distinct_owners": 3 }`,
   },
   {
+    key: 'having',
+    section: 'API Reference',
+    title: 'Having',
+    tagline: 'Filter groups by their aggregated values (SQL HAVING).',
+    intro: 'having takes the same AND/OR/NOT tree as filter_fields, but every condition references an aggregation alias instead of a model field. filter_fields still filter the rows before grouping (WHERE). Allowed operators: is, is_not, lt, lte, gt, gte, between, in, not_in.',
+    endpoints: [
+      { method: 'POST', path: '/api/query/', description: 'add having to an aggregation query' },
+    ],
+    params: [
+      { name: 'having', type: 'object', description: 'Filter tree whose fields are aggregation aliases.' },
+    ],
+    code: `POST /api/query/\n{\n  "model": "Device",\n  "select_fields": ["status"],\n  "aggregations": [{ "function": "count", "alias": "n" }],\n  "having": {\n    "and_operation": [\n      { "field": "n", "op": "gte", "value": "10" }\n    ]\n  }\n}`,
+  },
+  {
+    key: 'export',
+    section: 'API Reference',
+    title: 'Export',
+    tagline: 'Download every result row, not just one page.',
+    intro: 'The export endpoint takes the same payload as /api/query/ (page and page_size are ignored) and streams all rows as CSV or JSON. At most MAX_EXPORT_ROWS rows are written; the X-QLab-Truncated header is "true" when the export was cut off.',
+    endpoints: [
+      { method: 'POST', path: '/api/query/export/', description: 'stream all rows as csv or json' },
+    ],
+    params: [
+      { name: 'format', type: 'string', description: 'csv (default) or json.' },
+    ],
+    code: `POST /api/query/export/\n{\n  "model": "Device",\n  "select_fields": ["id", "name"],\n  "format": "csv"\n}`,
+  },
+  {
+    key: 'sharing',
+    section: 'API Reference',
+    title: 'Share Links',
+    tagline: 'Short links that work for queries of any size.',
+    intro: 'The Share button stores the query payload server side and copies a short ?share=<token> link. Recipients run the query with their own permissions and queryset scoping.',
+    endpoints: [
+      { method: 'POST', path: '/api/shares/', description: 'store a payload, returns a token' },
+      { method: 'GET', path: '/api/shares/<token>/', description: 'resolve a token' },
+    ],
+    params: [
+      { name: 'model_name', type: 'string', description: 'Model of the shared query.' },
+      { name: 'app_label', type: 'string', description: 'App label of the model.' },
+      { name: 'query_payload', type: 'object', description: 'The query payload to share.' },
+    ],
+    code: `POST /api/shares/\n{ "model_name": "Device", "app_label": "inventory",\n  "query_payload": { ... } }\n\n// → { "token": "x7Gq2PZk0aBc", ... }`,
+  },
+  {
     key: 'pagination',
     section: 'API Reference',
     title: 'Pagination',
@@ -221,10 +270,9 @@ const DOCS_ENTRIES: DocsEntry[] = [
       { method: 'POST', path: '/api/query/', description: 'validation and execution errors' },
     ],
     params: [
-      { name: 'detail', type: 'string', description: 'Top-level error message.' },
-      { name: 'errors', type: 'array', description: 'Optional list of field-specific issues.' },
+      { name: 'errors', type: 'array', description: 'List of issues, each with loc, msg, type and code.' },
     ],
-    code: `{\n  "detail": "Invalid filter field",\n  "errors": [\n    { "field": "foo__bar", "message": "Unknown lookup path" }\n  ]\n}`,
+    code: `{\n  "errors": [\n    {\n      "loc": ["field"],\n      "msg": "Field 'foo' does not exist in model Device",\n      "type": "value_error",\n      "code": "VALUE_ERROR"\n    }\n  ]\n}`,
   },
 ]
 
@@ -243,6 +291,9 @@ const DOCS_GROUPS: DocsNavGroup[] = [
       { key: 'query-params', label: 'Query Params' },
       { key: 'filtering', label: 'Filtering' },
       { key: 'aggregations', label: 'Aggregations' },
+      { key: 'having', label: 'Having' },
+      { key: 'export', label: 'Export' },
+      { key: 'sharing', label: 'Share Links' },
       { key: 'pagination', label: 'Pagination' },
       { key: 'permissions', label: 'Permissions' },
     ],
@@ -372,8 +423,39 @@ export default function App() {
         setHistoryItems(bootstrap.history)
         setSavedQueries(bootstrap.saved_queries)
         setActiveSavedQueryId(bootstrap.saved_queries[0]?.id ?? null)
+        // Bootstrap only carries the first 20 saved queries — load them all.
+        void getSavedQueries()
+          .then((all) => {
+            if (isMounted) setSavedQueries(all)
+          })
+          .catch((error) => console.error(error))
 
         const urlParams = new URLSearchParams(window.location.search)
+        const shareToken = urlParams.get('share')
+        if (shareToken) {
+          setUrlParam('share', null)
+          try {
+            const shared = await getShare(shareToken)
+            const sharedModel = bootstrap.models.find(
+              (m) => m.model_name === shared.model_name && m.app_label === shared.app_label,
+            )
+            if (!isMounted) return
+            if (sharedModel) {
+              urlParams.set('model', modelKey(sharedModel.app_label, sharedModel.model_name))
+              setUrlParam('fields', null)
+              setUrlParam('filters', null)
+              setQueryPreset({
+                ...shared.query_payload,
+                model: sharedModel.model_name,
+                app_label: sharedModel.app_label,
+              })
+            } else {
+              urlParams.set('model', modelKey(shared.app_label, shared.model_name))
+            }
+          } catch {
+            pushToast('error', 'This share link is invalid or has expired.')
+          }
+        }
         const urlModel = urlParams.get('model')
         const firstModel = bootstrap.models[0]
           ? modelKey(bootstrap.models[0].app_label, bootstrap.models[0].model_name)
@@ -539,15 +621,32 @@ export default function App() {
   }
 
   const handleRecentQuerySelect = (query: RecentQuery) => {
-    const match = bootstrapModels.find((model) => model.model_name === query.modelName)
+    const match = findModel(query.modelName, query.appLabel)
     if (match) {
       handleModelSelect(modelKey(match.app_label, match.model_name))
+    }
+    if (query.queryPayload) {
+      // Load the query itself, not just its model.
+      const { saved_query_id: _savedId, export_format: _format, ...payload } = query.queryPayload
+      setQueryPreset({ ...(payload as unknown as QueryRequest), page: 1 })
     }
     setActiveTab('queries')
   }
 
+  const findModel = (modelName: string, appLabel?: string) =>
+    bootstrapModels.find(
+      (entry) => entry.model_name === modelName && (!appLabel || entry.app_label === appLabel),
+    ) || bootstrapModels.find((entry) => entry.model_name === modelName)
+
+  const uniqueSavedQueryName = (base: string, taken: Set<string>) => {
+    if (!taken.has(base)) return base
+    let index = 2
+    while (taken.has(`${base} (${index})`)) index += 1
+    return `${base} (${index})`
+  }
+
   const handleReplayQuery = (item: HistoryItem) => {
-    const model = bootstrapModels.find((entry) => entry.model_name === item.model)
+    const model = findModel(item.model, item.appLabel)
     if (model) {
       handleModelSelect(modelKey(model.app_label, model.model_name))
     }
@@ -643,10 +742,35 @@ export default function App() {
     }
   })
 
-  const recentQueries: RecentQuery[] = historyItems.slice(0, 4).map((item) => ({
+  // Paging through results records one run per page; show each distinct
+  // query only once in the sidebar (and skip failed runs).
+  const recentHistory: QueryHistoryItem[] = []
+  const seenRecent = new Set<string>()
+  for (const item of historyItems) {
+    if (item.status === 'failed') continue
+    const {
+      page: _page,
+      page_size: _pageSize,
+      title: _title,
+      saved_query_id: _savedId,
+      export_format: _exportFormat,
+      order_by: _orderBy,
+      format: _format,
+      ...rest
+    } = (item.query_payload || {}) as Record<string, unknown>
+    const signature = `${item.app_label}::${item.model_name}::${JSON.stringify(rest)}`
+    if (seenRecent.has(signature)) continue
+    seenRecent.add(signature)
+    recentHistory.push(item)
+    if (recentHistory.length === 4) break
+  }
+
+  const recentQueries: RecentQuery[] = recentHistory.map((item) => ({
     title: item.title || `${getModelDisplayLabel(bootstrapModels.find((model) => model.model_name === item.model_name) || { model_name: item.model_name, verbose_name: item.model_name, app_label: '', verbose_name_plural: '' })} query`,
     meta: `${getModelDisplayLabel(bootstrapModels.find((model) => model.model_name === item.model_name) || { model_name: item.model_name, verbose_name: item.model_name, app_label: '', verbose_name_plural: '' })} · ${item.result_count ?? 0} results`,
     modelName: item.model_name,
+    appLabel: item.app_label,
+    queryPayload: item.query_payload,
   }))
 
   const savedQueriesForView = savedQueries.map((query) => ({
@@ -679,6 +803,7 @@ export default function App() {
     duration: item.duration_ms ? `${item.duration_ms} ms` : '—',
     status: item.status === 'failed' ? 'failed' : item.status === 'draft' ? 'draft' : item.saved_query ? 'cached' : 'ok',
     queryPayload: item.query_payload,
+    appLabel: item.app_label,
   }))
 
   const now = Date.now()
@@ -729,7 +854,7 @@ export default function App() {
         onTabChange={setActiveTab}
         theme={theme}
         onThemeToggle={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
-        version="v0.4.1"
+        version="v0.5.0"
       />
 
       <div className="app-content">
@@ -812,6 +937,15 @@ export default function App() {
                 throw error
               }
             }}
+            onExportQuery={(payload, format) => exportQuery(payload, format)}
+            onShareQuery={async (payload) => {
+              const shared = await createShare({
+                app_label: activeModelEntry?.app_label || payload.app_label,
+                model_name: payload.model,
+                query_payload: payload,
+              })
+              return shared.token
+            }}
             onRunQuery={async (payload) => {
               // Errors surface inline in QueriesPage via .query-error, not as a toast, to avoid duplicate messaging.
               const response = await runQuery(payload)
@@ -852,6 +986,7 @@ export default function App() {
                 pushToast('success', `Updated "${updated.name}".`)
               } catch (error) {
                 pushToast('error', error instanceof Error ? error.message : 'Could not update saved query.')
+                throw error
               }
             }}
             onDeleteSavedQuery={async (id) => {
@@ -880,15 +1015,23 @@ export default function App() {
         {activeTab === 'history' && (
           <HistoryPage
             historyItems={filteredHistoryItems}
+            savedQueryNames={savedQueries.map((entry) => entry.name)}
             onReplayQuery={handleReplayQuery}
-            onSaveQuery={async (item) => {
+            onSaveQuery={async (item, takenNames) => {
               try {
+                // Names are unique per user — saving the same history entry
+                // twice (or several "Device query" runs at once) used to fail.
+                const taken = takenNames ?? new Set(savedQueries.map((entry) => entry.name))
+                const name = uniqueSavedQueryName(item.title || `${item.model} query`, taken)
+                taken.add(name)
+                const { saved_query_id: _savedId, export_format: _format, ...payload } =
+                  (item.queryPayload || {}) as Record<string, unknown>
                 const created = await createSavedQuery({
-                  name: item.title || `${item.model} query`,
+                  name,
                   description: `Saved from history on ${item.ranAt}`,
-                  app_label: bootstrapModels.find((entry) => entry.model_name === item.model)?.app_label || '',
+                  app_label: item.appLabel || findModel(item.model)?.app_label || '',
                   model_name: item.model,
-                  query_payload: item.queryPayload as Record<string, unknown>,
+                  query_payload: payload,
                   tags: ['history'],
                   is_shared: false,
                 })

@@ -69,6 +69,7 @@ export interface MetadataField {
   label: string
   required: boolean
   primary_key?: boolean
+  unique?: boolean
   allowed_operations: string[]
   related_model?: string | null
   related_app_label?: string | null
@@ -93,7 +94,7 @@ interface MetadataRequestOptions {
 export interface QueryCondition {
   field: string
   op: string
-  value: string
+  value: string | string[]
 }
 
 export interface QueryFilterGroup {
@@ -105,7 +106,8 @@ export interface QueryFilterGroup {
 export type AggregationFunction = 'count' | 'sum' | 'avg' | 'min' | 'max'
 
 export interface AggregationSpec {
-  field: string
+  /** Optional for count: without a field the rows of each group are counted. */
+  field?: string
   function: AggregationFunction
   alias?: string
   distinct?: boolean
@@ -117,6 +119,10 @@ export interface QueryRequest {
   select_fields: string[]
   filter_fields?: QueryFilterGroup
   aggregations?: AggregationSpec[]
+  /** Filter on aggregation aliases (SQL HAVING). Requires aggregations. */
+  having?: QueryFilterGroup
+  order_by?: string[]
+  count?: 'exact' | 'estimate' | 'none'
   page?: number
   page_size?: number
   title?: string
@@ -124,10 +130,13 @@ export interface QueryRequest {
 }
 
 export interface QueryResponse {
-  count: number
+  /** null when the count was skipped (count mode "none"). */
+  count: number | null
+  count_exact?: boolean
   page: number
   page_size: number
-  total_pages: number
+  /** null when the total is unknown. */
+  total_pages: number | null
   next: number | null
   previous: number | null
   results: Array<Record<string, unknown>>
@@ -152,17 +161,37 @@ function getCsrfToken(): string {
   return ''
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function request(path: string, init?: RequestInit): Promise<Response> {
   const csrfToken = getCsrfToken()
-  const response = await fetch(`${API_BASE}${path}`, {
+  return fetch(`${API_BASE}${path}`, {
     credentials: 'include',
+    ...init,
     headers: {
       'Content-Type': 'application/json',
       ...(csrfToken ? { 'X-CSRFToken': csrfToken } : {}),
       ...(init?.headers || {}),
     },
-    ...init,
   })
+}
+
+function errorMessage(response: Response, payload: any): string {
+  const firstFieldError =
+    payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? Object.values(payload as Record<string, unknown>).find(
+          (value): value is string[] =>
+            Array.isArray(value) && typeof value[0] === 'string',
+        )?.[0]
+      : undefined
+  return (
+    payload?.detail ||
+    payload?.errors?.[0]?.msg ||
+    firstFieldError ||
+    `Request failed with status ${response.status}`
+  )
+}
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await request(path, init)
 
   const contentType = response.headers.get('content-type') || ''
   const payload = contentType.includes('application/json')
@@ -170,19 +199,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     : null
 
   if (!response.ok) {
-    const firstFieldError =
-      payload && typeof payload === 'object' && !Array.isArray(payload)
-        ? Object.values(payload as Record<string, unknown>).find(
-            (value): value is string[] =>
-              Array.isArray(value) && typeof value[0] === 'string',
-          )?.[0]
-        : undefined
-    const message =
-      payload?.detail ||
-      payload?.errors?.[0]?.msg ||
-      firstFieldError ||
-      `Request failed with status ${response.status}`
-    throw new Error(message)
+    throw new Error(errorMessage(response, payload))
   }
 
   return payload as T
@@ -227,6 +244,71 @@ export function runQuery(payload: QueryRequest) {
     method: 'POST',
     body: JSON.stringify(payload),
   })
+}
+
+export type ExportFormat = 'csv' | 'json'
+
+export interface ExportResult {
+  blob: Blob
+  filename: string
+  totalCount: number | null
+  exportedCount: number | null
+  truncated: boolean
+}
+
+/** Export every row of a query (all pages), streamed by the backend. */
+export async function exportQuery(
+  payload: QueryRequest,
+  format: ExportFormat = 'csv',
+): Promise<ExportResult> {
+  const { page: _page, page_size: _pageSize, ...rest } = payload
+  const response = await request('/query/export/', {
+    method: 'POST',
+    body: JSON.stringify({ ...rest, format }),
+  })
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || ''
+    const errorPayload = contentType.includes('application/json')
+      ? await response.json()
+      : null
+    throw new Error(errorMessage(response, errorPayload))
+  }
+  const disposition = response.headers.get('content-disposition') || ''
+  const filename =
+    /filename="?([^";]+)"?/.exec(disposition)?.[1] ||
+    `${payload.model.toLowerCase()}-export.${format}`
+  const toNumber = (value: string | null) =>
+    value === null || value === '' ? null : Number(value)
+  return {
+    blob: await response.blob(),
+    filename,
+    totalCount: toNumber(response.headers.get('x-qlab-total-count')),
+    exportedCount: toNumber(response.headers.get('x-qlab-exported-count')),
+    truncated: response.headers.get('x-qlab-truncated') === 'true',
+  }
+}
+
+export interface SharedQueryLink {
+  token: string
+  app_label: string
+  model_name: string
+  query_payload: QueryRequest
+  created_at: string
+}
+
+export function createShare(payload: {
+  app_label?: string
+  model_name: string
+  query_payload: QueryRequest
+}) {
+  return requestJson<SharedQueryLink>('/shares/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getShare(token: string) {
+  return requestJson<SharedQueryLink>(`/shares/${encodeURIComponent(token)}/`)
 }
 
 export function getHistory(limit = 50) {
