@@ -5,7 +5,12 @@ from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from qlab.mixins import NeighborhoodMixin, QLabMetadataMixin, QLabMixin
+from qlab.mixins import (
+    NeighborhoodMixin,
+    QLabMetadataMixin,
+    QLabMixin,
+    QLabSuggestMixin,
+)
 from qlab.models import ModelRegistry, QLabUserSettings, QueryRunHistory, SavedQuery
 from qlab.serializers import (
     QLabUserSettingsSerializer,
@@ -51,6 +56,7 @@ class QLabFrontendApiViewSet(
     QLabMixin,
     NeighborhoodMixin,
     QLabMetadataMixin,
+    QLabSuggestMixin,
     viewsets.ViewSet,
 ):
     """

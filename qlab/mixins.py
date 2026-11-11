@@ -18,6 +18,7 @@ from typing import Optional
 from django.apps import apps
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
+from django.db import models
 from django.db.models import Avg, Count, Max, Min, Q, Sum
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, extend_schema, inline_serializer
@@ -26,9 +27,13 @@ from rest_framework.response import Response
 
 from qlab.helpers import (
     build_q,
+    estimate_count,
     find_to_many_relation_paths,
     flatten_filter_conditions,
     get_model_metadata,
+    is_valid_lookup_syntax,
+    resolve_field,
+    validate_field_path,
 )
 from qlab.model_validation import ValidationError
 from qlab.pydantic_filters import QueryFilter
@@ -36,6 +41,7 @@ from qlab.serializers import (
     MetaDataRequestSerializer,
     ModelMetadataSerializer,
     ResponseSerializer,
+    SuggestRequestSerializer,
 )
 from qlab.settings import qlab_settings
 
@@ -55,6 +61,30 @@ _ERROR_SCHEMA = inline_serializer(
             )
         )
     },
+)
+
+
+def _field_error(loc: str, msg: str) -> Response:
+    return Response(
+        ValidationError([{"loc": (loc,), "msg": msg, "type": "value_error"}]).errors(),
+        status=400,
+    )
+
+
+def _syntax_error(field_path: str) -> dict:
+    return {
+        "loc": ("field",),
+        "msg": f"Field '{field_path}' syntax is incorrect. Use __ for relations and _ for attributes.",
+        "type": "syntax_error",
+    }
+
+
+# Fields whose values are not meaningful as typeahead suggestions.
+SUGGEST_UNSUPPORTED_FIELDS = (
+    models.JSONField,
+    models.FileField,
+    models.ManyToManyField,
+    models.BooleanField,
 )
 
 
@@ -208,6 +238,8 @@ class QLabMixin:
                 select_fields=payload["select_fields"],
                 filter_fields=payload.get("filter_fields", None),
                 aggregations=payload.get("aggregations", []),
+                order_by=payload.get("order_by", []),
+                count=payload.get("count", None),
                 page=payload.get("page", 1),
                 app_label=payload.get("app_label", qlab_settings.DEFAULT_APP_LABEL),
             )
@@ -357,6 +389,44 @@ class QLabMixin:
                 f"{relation}__pk" for relation in to_many_relations
             ]
 
+        # User ordering comes first; the deterministic keys above stay as
+        # tiebreakers so LIMIT/OFFSET pagination remains stable.
+        requested_order = list(query.order_by)
+        requested_names = {entry.lstrip("-") for entry in requested_order}
+        order_fields = requested_order + [
+            f for f in order_fields if f not in requested_names
+        ]
+
+        def page_out_of_range():
+            _record_query_history(
+                request,
+                payload=payload,
+                app_label=app_label,
+                model_name=query.model,
+                status="failed",
+                duration_ms=int((monotonic() - started_at) * 1000),
+                error_message=f"Page '{query.page}' is out of range.",
+            )
+            return Response(
+                {
+                    "errors": [
+                        {
+                            "loc": ["page"],
+                            "msg": f"Page '{query.page}' is out of range.",
+                            "type": "value_error.page",
+                            "code": "VALUE_ERROR_PAGE",
+                        }
+                    ]
+                },
+                status=400,
+            )
+
+        count_mode = query.count or qlab_settings.DEFAULT_COUNT_MODE
+        page_size = min(
+            payload.get("page_size", qlab_settings.PAGE_SIZE),
+            qlab_settings.MAX_PAGE_SIZE,
+        )
+
         # Apply custom scoping via get_queryset(), then apply QLab filters on top
         try:
             raw_results = self.get_queryset(model).filter(q_obj).values(*select_fields)
@@ -364,36 +434,34 @@ class QLabMixin:
                 raw_results = raw_results.annotate(**aggregate_kwargs)
             raw_results = raw_results.order_by(*order_fields)
 
-            page_size = min(
-                payload.get("page_size", qlab_settings.PAGE_SIZE),
-                qlab_settings.MAX_PAGE_SIZE,
-            )
-            paginator = Paginator(raw_results, page_size)
-            try:
-                page_obj = paginator.page(query.page)
-            except (PageNotAnInteger, EmptyPage):
-                _record_query_history(
-                    request,
-                    payload=payload,
-                    app_label=app_label,
-                    model_name=query.model,
-                    status="failed",
-                    duration_ms=int((monotonic() - started_at) * 1000),
-                    error_message=f"Page '{query.page}' is out of range.",
-                )
-                return Response(
-                    {
-                        "errors": [
-                            {
-                                "loc": ["page"],
-                                "msg": f"Page '{query.page}' is out of range.",
-                                "type": "value_error.page",
-                                "code": "VALUE_ERROR_PAGE",
-                            }
-                        ]
-                    },
-                    status=400,
-                )
+            if count_mode == "exact":
+                paginator = Paginator(raw_results, page_size)
+                try:
+                    page_obj = paginator.page(query.page)
+                except (PageNotAnInteger, EmptyPage):
+                    return page_out_of_range()
+                rows = list(page_obj.object_list)
+                total_count = paginator.count
+                count_exact = True
+                total_pages = paginator.num_pages
+                has_next = page_obj.has_next()
+                has_previous = page_obj.has_previous()
+            else:
+                # Skip the full count(*): fetch one extra row to know whether
+                # a next page exists, and optionally estimate the total.
+                offset = (query.page - 1) * page_size
+                rows = list(raw_results[offset : offset + page_size + 1])
+                has_next = len(rows) > page_size
+                rows = rows[:page_size]
+                if not rows and query.page > 1:
+                    return page_out_of_range()
+                has_previous = query.page > 1
+                total_count, count_exact = None, False
+                total_pages = None
+                if count_mode == "estimate":
+                    total_count, count_exact = estimate_count(raw_results)
+                    if total_count is not None:
+                        total_pages = max(1, -(-total_count // page_size))
         except (ValueError, TypeError, DjangoValidationError) as e:
             _record_query_history(
                 request,
@@ -419,19 +487,18 @@ class QLabMixin:
             )
 
         if not pk_included:
-            results = [{"id": row[pk_field], **row} for row in page_obj.object_list]
+            results = [{"id": row[pk_field], **row} for row in rows]
         else:
-            results = list(page_obj.object_list)
+            results = rows
 
         data = {
-            "count": paginator.count,
-            "page": page_obj.number,
+            "count": total_count,
+            "count_exact": count_exact,
+            "page": query.page,
             "page_size": page_size,
-            "total_pages": paginator.num_pages,
-            "next": page_obj.next_page_number() if page_obj.has_next() else None,
-            "previous": (
-                page_obj.previous_page_number() if page_obj.has_previous() else None
-            ),
+            "total_pages": total_pages,
+            "next": query.page + 1 if has_next else None,
+            "previous": query.page - 1 if has_previous else None,
             "results": results,
         }
 
@@ -442,7 +509,7 @@ class QLabMixin:
             model_name=query.model,
             status="success",
             duration_ms=int((monotonic() - started_at) * 1000),
-            result_count=paginator.count,
+            result_count=total_count,
         )
 
         return Response(ResponseSerializer(data).data)
@@ -460,6 +527,16 @@ class QLabMixin:
                 "model": serializers.CharField(),
                 "select_fields": serializers.ListField(child=serializers.CharField()),
                 "filter_fields": serializers.DictField(required=False),
+                "order_by": serializers.ListField(
+                    child=serializers.CharField(),
+                    required=False,
+                    help_text="Fields to sort by; prefix with '-' for descending.",
+                ),
+                "count": serializers.ChoiceField(
+                    choices=["exact", "estimate", "none"],
+                    required=False,
+                    help_text="How to count the total; defaults to DEFAULT_COUNT_MODE.",
+                ),
                 "page": serializers.IntegerField(required=False, default=1),
                 "page_size": serializers.IntegerField(required=False),
                 "app_label": serializers.CharField(required=False),
@@ -493,6 +570,122 @@ class QLabMixin:
     def post(self, request):
         """Execute a dynamic QLab query."""
         return self.execute_query(request, request.data)
+
+
+class QLabSuggestMixin:
+    """
+    Mixin for DRF ViewSets that suggests distinct values of a model field.
+
+    Meant for typeahead filter inputs: instead of preloading every distinct
+    value of a column, the client asks for a small, prefix-matched, cursor
+    paged slice as the user types. The queryset is scoped through
+    ``get_queryset(model)``, so values a user may not see are never returned.
+
+    For large tables, back the suggested columns with an index (for prefix
+    matching on PostgreSQL: ``text_pattern_ops`` or a trigram index).
+    """
+
+    def get_queryset(self, model):
+        return model.objects.all()
+
+    @extend_schema(
+        summary="Suggest Field Values",
+        description=(
+            "Return distinct values of a field for typeahead inputs.\n\n"
+            "Values are ordered ascending and paged with a cursor: pass the "
+            "returned next_cursor as cursor to load the following slice."
+        ),
+        request=SuggestRequestSerializer,
+        responses={
+            200: inline_serializer(
+                name="QLabSuggestResponse",
+                fields={
+                    "field": serializers.CharField(),
+                    "values": serializers.ListField(),
+                    "next_cursor": serializers.CharField(allow_null=True),
+                },
+            ),
+            400: _ERROR_SCHEMA,
+        },
+    )
+    def suggest(self, request):
+        """Return distinct, cursor-paged values of a model field."""
+        serializer = SuggestRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+        params = serializer.validated_data
+
+        model_name = params["model"]
+        app_label = params.get("app_label") or qlab_settings.DEFAULT_APP_LABEL
+        field_path = params["field"]
+
+        allowed_app = _check_allowed_app(app_label)
+        if allowed_app:
+            return allowed_app
+        restricted = _check_restricted(model_name, app_label, request.user)
+        if restricted:
+            return restricted
+        try:
+            model = apps.get_model(app_label, model_name)
+        except LookupError:
+            return _field_error(
+                "model", f"Model '{model_name}' does not exist in app '{app_label}'."
+            )
+
+        errors = []
+        if not is_valid_lookup_syntax(field_path) or not validate_field_path(
+            model, field_path, errors
+        ):
+            return Response(
+                ValidationError(errors or [_syntax_error(field_path)]).errors(),
+                status=400,
+            )
+        field = resolve_field(model, field_path)
+        if (
+            field is None
+            or isinstance(field, SUGGEST_UNSUPPORTED_FIELDS)
+            or find_to_many_relation_paths(model, field_path)
+        ):
+            return _field_error(
+                "field", f"Field '{field_path}' does not support value suggestions."
+            )
+
+        limit = min(
+            params.get("limit") or qlab_settings.SUGGEST_LIMIT,
+            qlab_settings.MAX_SUGGEST_LIMIT,
+        )
+        text = params.get("q", "")
+        lookup = "icontains" if params.get("match") == "contains" else "istartswith"
+
+        queryset = self.get_queryset(model).filter(**{f"{field_path}__isnull": False})
+        if isinstance(field, (models.CharField, models.TextField)):
+            queryset = queryset.exclude(**{field_path: ""})
+        if text:
+            queryset = queryset.filter(**{f"{field_path}__{lookup}": text})
+        cursor = params.get("cursor")
+        if cursor not in (None, ""):
+            queryset = queryset.filter(**{f"{field_path}__gt": cursor})
+
+        try:
+            values = list(
+                queryset.order_by(field_path)
+                .values_list(field_path, flat=True)
+                .distinct()[: limit + 1]
+            )
+        except (ValueError, TypeError, DjangoValidationError):
+            return _field_error(
+                "cursor", "The query or cursor is invalid for this field."
+            )
+
+        has_next = len(values) > limit
+        values = values[:limit]
+        return Response(
+            {
+                "field": field_path,
+                "values": values,
+                "next_cursor": values[-1] if has_next else None,
+            }
+        )
 
 
 class NeighborhoodMixin:

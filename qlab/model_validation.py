@@ -11,7 +11,34 @@ These models ensure type safety and validate query structure before execution.
 
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
+
+# Every filter operation the API accepts. Which of them a concrete field
+# supports is decided by qlab.helpers.FIELD_OPS.
+ALL_OPERATIONS = (
+    "is",
+    "is_not",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "icontains",
+    "istartswith",
+    "iendswith",
+    "in",
+    "not_in",
+    "between",
+)
+# Operations whose value is a list instead of a single string.
+LIST_OPERATIONS = ("in", "not_in", "between")
+
+
+def _to_bool_or_str(value: str):
+    if value in ("true", "True"):
+        return True
+    if value in ("false", "False"):
+        return False
+    return value
 
 
 class ValidationError(Exception):
@@ -102,7 +129,7 @@ class Condition(BaseModel):
 
     field: str
     op: str
-    value: str
+    value: Union[str, List[str]]
 
     @field_validator("op")
     def validate_op(cls, op: str) -> str:
@@ -117,6 +144,11 @@ class Condition(BaseModel):
             - gt: Greater than
             - gte: Greater than or equal to
             - icontains: Case-insensitive substring search
+            - istartswith: Case-insensitive prefix match
+            - iendswith: Case-insensitive suffix match
+            - in: Value is one of a list
+            - not_in: Value is none of a list
+            - between: Inclusive range, value is a list of two
 
         Args:
             op: Operation string to validate
@@ -131,7 +163,7 @@ class Condition(BaseModel):
             >>> Condition(field="size", op="gte", value="100")  # Valid
             >>> Condition(field="size", op="invalid", value="100")  # Raises ValidationError
         """
-        allowed_ops = ["is", "is_not", "lt", "lte", "gt", "gte", "icontains"]
+        allowed_ops = list(ALL_OPERATIONS)
         if op not in allowed_ops:
             raise ValidationError(
                 [
@@ -144,8 +176,44 @@ class Condition(BaseModel):
             )
         return op
 
+    @model_validator(mode="after")
+    def validate_value_shape(self):
+        """Check that the value is a list for list operations, a string otherwise."""
+        if self.op in LIST_OPERATIONS:
+            if not isinstance(self.value, list) or not self.value:
+                raise ValidationError(
+                    [
+                        {
+                            "loc": ("filter_fields", self.field),
+                            "msg": f"Operation '{self.op}' requires a non-empty list value.",
+                            "type": "value_error.value_shape",
+                        }
+                    ]
+                )
+            if self.op == "between" and len(self.value) != 2:
+                raise ValidationError(
+                    [
+                        {
+                            "loc": ("filter_fields", self.field),
+                            "msg": "Operation 'between' requires exactly two values: [start, end].",
+                            "type": "value_error.value_shape",
+                        }
+                    ]
+                )
+        elif isinstance(self.value, list):
+            raise ValidationError(
+                [
+                    {
+                        "loc": ("filter_fields", self.field),
+                        "msg": f"Operation '{self.op}' requires a single value, not a list.",
+                        "type": "value_error.value_shape",
+                    }
+                ]
+            )
+        return self
+
     @field_validator("value")
-    def validate_value(cls, value: str) -> Union[str, bool]:
+    def validate_value(cls, value):
         """
         Validate and convert value, handling boolean string conversion.
 
@@ -172,12 +240,9 @@ class Condition(BaseModel):
             >>> cond.value
             'test'
         """
-        # Convert string boolean representations to actual booleans
-        if value in ["true", "True"]:
-            return True
-        if value in ["false", "False"]:
-            return False
-        return value
+        if isinstance(value, list):
+            return [_to_bool_or_str(item) for item in value]
+        return _to_bool_or_str(value)
 
 
 class Filter(BaseModel):

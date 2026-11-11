@@ -19,6 +19,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from qlab.helpers import (
     check_attribute_operation,
+    find_to_many_relation_paths,
     flatten_filter_conditions,
     is_numeric_field_path,
     is_valid_lookup_syntax,
@@ -120,8 +121,24 @@ class QueryFilter(BaseModel):
     select_fields: list[str]
     filter_fields: Optional[Filter] = None
     aggregations: list[AggregationSpec] = []
+    order_by: list[str] = []
+    count: Optional[str] = None
     page: int = 1
     app_label: Optional[str] = None
+
+    @field_validator("count")
+    def validate_count(cls, count: Optional[str]) -> Optional[str]:
+        if count is not None and count not in ("exact", "estimate", "none"):
+            raise ValidationError(
+                [
+                    {
+                        "loc": ("count",),
+                        "msg": "count must be one of 'exact', 'estimate' or 'none'.",
+                        "type": "value_error.count",
+                    }
+                ]
+            )
+        return count
 
     @field_validator("page")
     def validate_page(cls, page: int) -> int:
@@ -268,6 +285,17 @@ class QueryFilter(BaseModel):
                 raise ValidationError(errors)
 
             for cond in all_conditions:
+                if isinstance(cond.value, list) and (
+                    len(cond.value) > qlab_settings.MAX_IN_VALUES
+                ):
+                    errors.append(
+                        {
+                            "loc": ("filter_fields", cond.field),
+                            "msg": f"Too many values. Maximum allowed is {qlab_settings.MAX_IN_VALUES}.",
+                            "type": "value_error.max_in_values",
+                        }
+                    )
+                    continue
                 # First validate the field path exists
                 valid_field = self._validate_field(model, cond.field, errors)
 
@@ -315,11 +343,63 @@ class QueryFilter(BaseModel):
                         }
                     )
 
+        # --- Validate Order By ---
+        self._validate_order_by(model, errors)
+
         # Raise all collected errors at once for better UX
         if errors:
             raise ValidationError(errors)
 
         return self
+
+    def _validate_order_by(self, model, errors: list) -> None:
+        """
+        Validate order_by entries ("field" ascending, "-field" descending).
+
+        Ordering across a to-many relation would duplicate base rows, so it is
+        rejected. For aggregation queries only the group-by columns
+        (select_fields) and aggregation aliases can be ordered on.
+        """
+        if not self.order_by:
+            return
+
+        max_order = qlab_settings.MAX_ORDER_FIELDS
+        if len(self.order_by) > max_order:
+            errors.append(
+                {
+                    "loc": ["order_by"],
+                    "msg": f"Too many order_by fields. Maximum allowed is {max_order}.",
+                    "type": "value_error.max_order_by",
+                }
+            )
+            return
+
+        aliases = {agg.alias for agg in self.aggregations}
+        for entry in self.order_by:
+            name = entry[1:] if entry.startswith("-") else entry
+            if self.aggregations:
+                if name not in aliases and name not in self.select_fields:
+                    errors.append(
+                        {
+                            "loc": ("order_by", name),
+                            "msg": (
+                                f"'{name}' cannot be ordered on in an aggregation "
+                                "query; use a select field or an aggregation alias."
+                            ),
+                            "type": "value_error.order_by",
+                        }
+                    )
+                continue
+            if not self._validate_field(model, name, errors):
+                continue
+            if find_to_many_relation_paths(model, name):
+                errors.append(
+                    {
+                        "loc": ("order_by", name),
+                        "msg": f"Cannot order by '{name}': it crosses a to-many relation.",
+                        "type": "value_error.order_by",
+                    }
+                )
 
     def _validate_field(self, model, field: str, errors: list) -> bool:
         """

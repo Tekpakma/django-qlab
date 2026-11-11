@@ -137,6 +137,12 @@ QLAB_SETTINGS = {
     "MAX_PAGE_SIZE": 500,           # hard cap per request
     "MAX_RELATION_DEPTH": 2,        # how deep relation graphs expand
     "MAX_FILTER_CONDITIONS": 10,    # max filter nodes per query
+    "MAX_ORDER_FIELDS": 3,          # max order_by entries
+    "MAX_IN_VALUES": 200,           # max values in an in/not_in/between list
+    "DEFAULT_COUNT_MODE": "exact",  # exact | estimate | none
+    "COUNT_ESTIMATE_THRESHOLD": 10000,  # below this, estimates are counted exactly
+    "SUGGEST_LIMIT": 20,            # default suggestions per request
+    "MAX_SUGGEST_LIMIT": 50,        # hard cap for suggestions
     "MAX_NODES": 100,               # max records returned by neighborhood
     "ALLOWED_APPS": [],             # restrict to specific app labels (empty = all)
     "ENVIRONMENT_LABEL": "Production", # set qlab env
@@ -153,7 +159,8 @@ All routes are mounted relative to the prefix you chose (e.g. `/qlab/`):
 |---|---|---|
 | `GET` | `/` | Bundled React UI |
 | `GET` | `/api/bootstrap/` | Initial data load (models, settings) |
-| `POST` | `/api/query/` | Run a filtered, paginated query |
+| `POST` | `/api/query/` | Run a filtered, sorted, paginated query |
+| `POST` | `/api/suggest/` | Typeahead: distinct values of a field, cursor paged |
 | `POST` | `/api/metadata/` | Model field and relation schema |
 | `POST` | `/api/neighborhood/` | Relation graph for a set of records |
 | `GET / PATCH` | `/api/settings/` | Per-user UI settings |
@@ -189,6 +196,59 @@ All routes are mounted relative to the prefix you chose (e.g. `/qlab/`):
   "page_size": 100
 }
 ```
+
+### Filter operators
+
+| Operator | Value | Applies to |
+|---|---|---|
+| `is`, `is_not` | string | all fields |
+| `lt`, `lte`, `gt`, `gte` | string | numbers, dates, times |
+| `between` | `[start, end]` (inclusive) | numbers, dates, times |
+| `in`, `not_in` | list of strings (max `MAX_IN_VALUES`) | text, numbers, foreign keys, UUIDs |
+| `icontains`, `istartswith`, `iendswith` | string | text (`icontains` also JSON, UUID, M2M) |
+
+The `/api/metadata/` endpoint lists the operators each field supports.
+
+### Sorting
+
+Add `order_by` to the payload (at most `MAX_ORDER_FIELDS` entries). Prefix a
+field with `-` for descending order. Fields behind a to-many relation cannot
+be sorted on. In aggregation queries, order by a select field or an
+aggregation alias. The primary key is always appended as a tiebreaker so
+pagination stays stable.
+
+```json
+{ "model": "Device", "select_fields": ["id", "name"], "order_by": ["-created", "name"] }
+```
+
+### Count modes
+
+Counting every match is the expensive part of paginating large tables. Set
+`count` per request (or `DEFAULT_COUNT_MODE` globally):
+
+| `count` | Behaviour |
+|---|---|
+| `exact` (default) | Exact `count(*)`, as before |
+| `estimate` | PostgreSQL planner estimate; small results (below `COUNT_ESTIMATE_THRESHOLD`) and other databases are counted exactly. `count_exact` tells which you got |
+| `none` | No total (`count` and `total_pages` are `null`); `next` is still set correctly |
+
+### Value suggestions
+
+`POST /api/suggest/` returns distinct values of one field for typeahead
+inputs, scoped through your `get_queryset`:
+
+```json
+{ "model": "Device", "field": "status", "q": "ru", "limit": 20, "cursor": null }
+```
+
+```json
+{ "field": "status", "values": ["running"], "next_cursor": null }
+```
+
+Pass `next_cursor` back as `cursor` to load the next slice. `match` may be
+`"prefix"` (default) or `"contains"`. For large tables index the suggested
+columns (on PostgreSQL a `text_pattern_ops` or trigram index for prefix and
+contains matching).
 
 ---
 
