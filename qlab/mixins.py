@@ -18,6 +18,7 @@ from time import monotonic
 from typing import Optional
 
 from django.apps import apps
+from django.core.exceptions import ImproperlyConfigured
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
 from django.core.serializers.json import DjangoJSONEncoder
@@ -30,6 +31,7 @@ from pydantic import ValidationError as PydanticValidationError
 from rest_framework import serializers
 from rest_framework.response import Response
 
+from qlab.computed import get_computed_fields
 from qlab.helpers import (
     build_q,
     estimate_count,
@@ -548,8 +550,20 @@ class QLabMixin:
             if query.filter_fields
             else []
         )
+        computed = get_computed_fields(model)
+        computed_selected = {
+            name: computed[name] for name in query.select_fields if name in computed
+        }
+        # Model paths the computed fields read; fetched with the rows, but only
+        # returned if the client selected them itself.
+        required = list(
+            dict.fromkeys(
+                path for field in computed_selected.values() for path in field.requires
+            )
+        )
         all_paths = (
-            list(query.select_fields)
+            [name for name in query.select_fields if name not in computed_selected]
+            + required
             + [condition.field for condition in filter_conditions]
             + [agg.field for agg in query.aggregations if agg.field]
             + [
@@ -575,7 +589,10 @@ class QLabMixin:
         q_obj = build_q(query.filter_fields) if query.filter_fields else Q()
 
         pk_field = model._meta.pk.name
-        select_fields = list(query.select_fields)
+        select_fields = [
+            name for name in query.select_fields if name not in computed_selected
+        ]
+        helper_columns: list[str] = []
 
         def to_many_paths(paths) -> list[str]:
             found: list[str] = []
@@ -653,6 +670,8 @@ class QLabMixin:
             add_pk_column = pk_field not in select_fields
             if add_pk_column:
                 select_fields = [pk_field] + select_fields
+            helper_columns = [path for path in required if path not in select_fields]
+            select_fields = select_fields + helper_columns
 
             # Selecting a to-many field (e.g. "device__name") intentionally
             # yields one row per related record. Ordering by the base pk
@@ -702,9 +721,41 @@ class QLabMixin:
                 "queryset": queryset,
                 "pk_field": pk_field,
                 "add_pk_column": add_pk_column,
+                "computed": computed_selected,
+                "helper_columns": helper_columns,
             },
             None,
         )
+
+    def _finalize_rows(self, rows, prepared, request):
+        """
+        Turn the rows of the queryset into the rows of the response.
+
+        Computed fields are resolved here, for all given rows at once (one page,
+        or one chunk of an export). The columns only they needed are dropped, and
+        the pk is exposed as "id" when it was added just to identify rows.
+        """
+        computed = prepared["computed"]
+        rows = list(rows)
+        if computed and rows:
+            resolved = {}
+            for name, field in computed.items():
+                values = list(field.resolve(rows, request))
+                if len(values) != len(rows):
+                    raise ImproperlyConfigured(
+                        f"Computed field '{name}' returned {len(values)} values for "
+                        f"{len(rows)} rows; resolve() must return one value per row."
+                    )
+                resolved[name] = values
+            helper = set(prepared["helper_columns"])
+            rows = [
+                {
+                    **{key: value for key, value in row.items() if key not in helper},
+                    **{name: resolved[name][index] for name in computed},
+                }
+                for index, row in enumerate(rows)
+            ]
+        return self._with_id_column(rows, prepared)
 
     @staticmethod
     def _with_id_column(rows, prepared):
@@ -817,7 +868,7 @@ class QLabMixin:
             "total_pages": total_pages,
             "next": query.page + 1 if has_next else None,
             "previous": query.page - 1 if has_previous else None,
-            "results": self._with_id_column(rows, prepared),
+            "results": self._finalize_rows(rows, prepared, request),
         }
 
         _record_query_history(
@@ -885,10 +936,10 @@ class QLabMixin:
             for row in queryset[:max_rows].iterator(chunk_size=2000):
                 chunk.append(row)
                 if len(chunk) >= 2000:
-                    yield from self._with_id_column(chunk, prepared)
+                    yield from self._finalize_rows(chunk, prepared, request)
                     chunk = []
             if chunk:
-                yield from self._with_id_column(chunk, prepared)
+                yield from self._finalize_rows(chunk, prepared, request)
 
         timestamp = timezone.now().strftime("%Y%m%d-%H%M%S")
         filename = f"{query.model.lower()}-{timestamp}.{export_format}"

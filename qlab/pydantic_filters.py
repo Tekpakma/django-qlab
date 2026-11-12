@@ -16,8 +16,9 @@ import re
 from typing import Optional
 
 from django.apps import apps
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, PrivateAttr, field_validator, model_validator
 
+from qlab.computed import get_computed_fields
 from qlab.helpers import (
     check_attribute_operation,
     check_value_type,
@@ -182,6 +183,8 @@ class QueryFilter(BaseModel):
     page: int = 1
     app_label: Optional[str] = None
 
+    _computed: Optional[dict] = PrivateAttr(default=None)
+
     @field_validator("count")
     def validate_count(cls, count: Optional[str]) -> Optional[str]:
         if count is not None and count not in ("exact", "estimate", "none"):
@@ -320,7 +323,21 @@ class QueryFilter(BaseModel):
                     "type": "value_error.empty_select_fields",
                 }
             )
+        computed = self._computed_fields(model)
         for field in self.select_fields:
+            if field in computed:
+                if self.aggregations:
+                    errors.append(
+                        {
+                            "loc": ("select_fields", field),
+                            "msg": (
+                                f"Computed field '{field}' cannot be selected in an "
+                                "aggregation query."
+                            ),
+                            "type": "value_error.computed_field",
+                        }
+                    )
+                continue
             self._validate_field(model, field, errors)
 
         # --- Validate Filter Fields ---
@@ -612,6 +629,12 @@ class QueryFilter(BaseModel):
                     }
                 )
 
+    def _computed_fields(self, model) -> dict:
+        """The computed fields of ``model``, looked up once per query."""
+        if self._computed is None:
+            self._computed = get_computed_fields(model)
+        return self._computed
+
     def _validate_field(self, model, field: str, errors: list) -> bool:
         """
         Validate a single field path.
@@ -648,6 +671,18 @@ class QueryFilter(BaseModel):
             >>> errors
             [{'loc': ('field',), 'msg': "Field 'invalid_field' does not exist...", ...}]
         """
+        if field in self._computed_fields(model):
+            errors.append(
+                {
+                    "loc": ("field",),
+                    "msg": (
+                        f"Field '{field}' is computed and can only be selected, "
+                        "not filtered, sorted or aggregated on."
+                    ),
+                    "type": "value_error.computed_field",
+                }
+            )
+            return False
         # First check if the syntax is valid (alphanumeric + underscores + __)
         if not is_valid_lookup_syntax(field):
             errors.append(

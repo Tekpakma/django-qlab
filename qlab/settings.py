@@ -39,6 +39,9 @@ QLAB_DEFAULTS = {
     # "app_label.Model.field" entries that are never exposed (metadata, query,
     # suggest). None = default: the user model's password hash.
     "EXCLUDED_FIELDS": None,
+    # "app_label.Model.field" -> ComputedField (class, instance or dotted path); see
+    # qlab.computed. Selectable like model fields, resolved per page of rows.
+    "COMPUTED_FIELDS": None,
     # Run history rows kept per user; older rows are pruned. 0 = keep all.
     "HISTORY_RETENTION": 1000,
     "INCLUDE_MODEL_COUNTS": False,

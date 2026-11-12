@@ -19,6 +19,7 @@ Inspect model data, run filtered queries, save and replay them — no custom vie
 - Saved queries with create, update, delete and bulk operations
 - Query run history with replay and save-from-history
 - Per-user settings stored in the database
+- Computed fields: values that are not columns, resolved per page of rows
 - Django admin integration for all persistence models
 
 ---
@@ -151,6 +152,7 @@ QLAB_SETTINGS = {
     "MAX_SHARE_PAYLOAD_BYTES": 65536,  # max size of a shared query payload
     "QUERY_VIEWSET": "qlab.api_views.QLabFrontendApiViewSet",  # scoped ViewSet
     "EXCLUDED_FIELDS": None,        # "app.Model.field" never exposed; None = user password
+    "COMPUTED_FIELDS": None,        # "app.Model.field" -> ComputedField, see "Computed fields"
     "HISTORY_RETENTION": 1000,      # run history kept per user; 0 = keep all
     "MAX_IN_VALUES": 200,           # max values in an in/not_in/between list
     "DEFAULT_COUNT_MODE": "exact",  # exact | estimate | none
@@ -313,6 +315,51 @@ Pass `next_cursor` back as `cursor` to load the next slice. `match` may be
 `"prefix"` (default) or `"contains"`. For large tables index the suggested
 columns (on PostgreSQL a `text_pattern_ops` or trigram index for prefix and
 contains matching).
+
+### Computed fields
+
+Some values a table needs are not columns: a link built from several tables,
+a label derived from a JSON field, a censored copy of a field you hide with
+`EXCLUDED_FIELDS`. Declare them per model; they are resolved for one page of
+rows at a time, so they can load what they need with a few queries instead of
+one per row.
+
+```python
+# settings.py
+QLAB_SETTINGS = {
+    "COMPUTED_FIELDS": {"shop.Order.customer_url": "shop.qlab.CustomerUrl"},
+}
+
+# shop/qlab.py
+from qlab.computed import ComputedField
+
+class CustomerUrl(ComputedField):
+    requires = ("customer",)          # model fields the value is derived from
+    label = "Customer URL"            # optional, shown in the metadata
+
+    def resolve(self, rows, request):
+        slugs = dict(
+            Customer.objects.filter(pk__in={row["customer"] for row in rows})
+            .values_list("pk", "slug")
+        )
+        return [f"/customers/{slugs[row['customer']]}/" for row in rows]
+```
+
+```json
+{ "model": "Order", "select_fields": ["id", "customer_url"] }
+```
+
+- Select a computed field like any other (query, export). It cannot be filtered,
+  sorted, grouped or aggregated on: it does not exist in the database.
+- `resolve(rows, request)` gets all rows of the page (or of one export chunk of
+  2000 rows) and returns one value per row, in the same order. Every row holds
+  the values of `requires` and the primary key.
+- The `requires` columns are fetched with the rows but only returned if the
+  client selected them itself. They may point at fields hidden through
+  `EXCLUDED_FIELDS`: the resolver is your code and decides what it returns.
+- The metadata endpoint lists the field with `"computed": true` and no
+  operations. Wrong registrations (a name that clashes with a real field, an
+  unknown or to-many `requires` path) raise `ImproperlyConfigured`.
 
 ---
 

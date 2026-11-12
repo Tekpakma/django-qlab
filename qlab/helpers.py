@@ -26,6 +26,7 @@ from django.db.models.fields.related import (
     OneToOneRel,
 )
 
+from qlab.computed import get_computed_field_metadata
 from qlab.model_validation import Condition, Filter
 from qlab.settings import qlab_settings
 
@@ -489,7 +490,7 @@ def get_model_metadata(
     """
     Return model metadata with a defensive copy of the cached payload.
     """
-    return deepcopy(
+    metadata = deepcopy(
         _get_model_metadata_cached(
             model_name=model_name,
             app_label=app_label,
@@ -497,6 +498,11 @@ def get_model_metadata(
             include_reverse_relations=include_reverse_relations,
         )
     )
+    # Computed fields come from settings, not from the model, so they are added
+    # outside the cached part.
+    model = apps.get_model(metadata["app_label"], metadata["model_name"])
+    metadata["fields"].extend(get_computed_field_metadata(model))
+    return metadata
 
 
 def build_q(filter_obj: Filter) -> Q:

@@ -79,6 +79,13 @@ class FieldMetadataSerializer(serializers.Serializer):
         default=False,
         help_text="True if the field stores NULL in the database",
     )
+    computed = serializers.BooleanField(
+        default=False,
+        help_text=(
+            "True if the value is computed by the host application: it can be "
+            "selected, but not filtered, sorted or aggregated on"
+        ),
+    )
 
 
 class ModelMetadataSerializer(serializers.Serializer):
